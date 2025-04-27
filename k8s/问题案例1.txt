@@ -1,0 +1,22 @@
+问题解决1：
+1、在kubeadm init启动打印的日志中查看detected和recommended的日志行
+2、按照建议修改
+比如这次一直报Initial timeout of 40s passed错误，
+查看日志有 detected that the sandbox image "/google_containers/pause:3.9" of the container runtime is inconsistent with that used by kubeadm. 
+It is recommended that using "registry.aliyuncs.com/google_containers/pause:3.9" as the CRI sandbox image.
+的异常日志。搜索后使用以下命令解决了：
+1、containerd config default | tee /etc/containerd/config.toml
+2、sed -i 's#SystemdCgroup = false#SystemdCgroup = true#g' /etc/containerd/config.toml
+3、sed -i 's#sandbox_image = "/google_containers/pause:3.9"#sandbox_image = "registry.aliyuncs.com/google_containers/pause:3.9"#g' /etc/containerd/config.toml
+4、systemctl restart containerd
+
+问题解决2：
+最新的k8s移除了对docker的直接调用，只使用了其中的containerd组件功能，因此对docker daemon配置文件的镜像设置，对k8s无效，需要设置containerd配置
+containerd配置位置是/etc/containerd/config.toml。
+1、需要在[plugins."io.containerd.grpc.v1.cri".registry.mirrors]配置下方添加镜像源配置
+2、aliyuncs镜像加速站（https://kp4ynhlt.mirror.aliyuncs.com）已被禁用无法使用
+3、查找其他加速站。添加以下配置：
+       [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+        endpoint=["https://docker.1ms.run"]
+       [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
+        endpoint=["https://docker.1ms.run", "https://k8s.m.daocloud.io", "https://docker.mirrors.ustc.edu.cn","https://hub-mirror.c.163.com"]

@@ -1,0 +1,109 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.java_study</groupId>
+    <artifactId>java_study</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <inceptionYear>2019</inceptionYear>
+
+    <properties>
+        <scala.version>2.12.8</scala.version>
+    </properties>
+
+
+    <dependencies>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.12</version>
+            <scope>compile</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>druid</artifactId>
+            <version>1.1.0</version>
+            <scope>compile</scope>
+        </dependency>
+
+<!--        <dependency>-->
+<!--            <groupId>com.tools</groupId>-->
+<!--            <artifactId>toolsUI</artifactId>-->
+<!--            <scope>system</scope>-->
+<!--            <systemPath>${project.basedir}/src/main/resources/toolsUI-5.5.3.jar</systemPath>-->
+<!--        </dependency>-->
+
+    </dependencies>
+
+    <build>
+        <sourceDirectory>src/main/java</sourceDirectory>
+        <plugins>
+            <!--第一个plugin：添加编译的支持，都编译成java1.8的版本-->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.6.1</version>
+                <configuration>
+                    <source>1.8</source>
+                    <target>1.8</target>
+                    <encoding>utf8</encoding>
+                </configuration>
+            </plugin>
+
+
+            <!--第二个plugin：添加scala编译的支持-->
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>3.2.2</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>
+                            <goal>testCompile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <args>
+                        <arg>-target:jvm-1.8</arg>
+                    </args>
+                    <jvmArgs>
+                        <!--Xss表示每个线程的堆栈大小-->
+                        <jvmArg>-Xss2048K</jvmArg>
+                        <!--Xms表示jvm初始化内存，无默认值-->
+                        <jvmArg>-Xms64m</jvmArg>
+                        <!--Xmx表示jvm最大可以用1024m的内存，默认为256 MB-->
+                        <jvmArg>-Xmx1024m</jvmArg>
+
+                    </jvmArgs>
+                </configuration>
+            </plugin>
+            <!--第三个plugin：添加打jar包的支持工具-->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>3.0.0</version>
+                <executions>
+                    <!--在应用maven package这个阶段的时候，该插件启动-->
+                    <execution>
+                        <id>make-assembly</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <!--<archive>-->
+                    <!--&lt;!&ndash;在jar包中指定启动类&ndash;&gt;-->
+                    <!--<manifest>-->
+                    <!--<mainClass>ai.h2o.automl.PredictMyData</mainClass>-->
+                    <!--</manifest>-->
+                    <!--</archive>-->
+                    <descriptorRefs>jar-with-dependencies</descriptorRefs>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

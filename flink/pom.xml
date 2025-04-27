@@ -1,0 +1,218 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.flink</groupId>
+  <artifactId>flink</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <inceptionYear>2019</inceptionYear>
+
+  <properties>
+    <scala.version>2.11.8</scala.version>
+  </properties>
+
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <version>2.5.1</version>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.kafka/kafka -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka_2.12</artifactId>
+            <version>2.5.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-streaming-java</artifactId>
+            <version>1.20.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-java</artifactId>
+            <version>1.20.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-files</artifactId>
+            <version>1.20.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.flink/flink-csv -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-csv</artifactId>
+            <version>1.20.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-kafka</artifactId>
+            <version>3.3.0-1.20</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-mysql-cdc</artifactId>
+            <version>3.2.0</version>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/com.ververica/flink-cdc-connectors -->
+        <dependency>
+            <groupId>com.ververica</groupId>
+            <artifactId>flink-cdc-connectors</artifactId>
+            <version>3.0.1</version>
+            <type>pom</type>
+        </dependency>
+
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-annotations</artifactId>
+            <version>2.16.2</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.solr</groupId>
+            <artifactId>solr-core</artifactId>
+            <version>9.7.0</version>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.solr/solr-solrj -->
+        <dependency>
+            <groupId>org.apache.solr</groupId>
+            <artifactId>solr-solrj</artifactId>
+            <version>9.7.0</version>
+        </dependency>
+
+
+        <!-- https://mvnrepository.com/artifact/org.apache.flink/flink-statebackend-rocksdb -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-statebackend-rocksdb</artifactId>
+            <version>1.20.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+
+        <!-- https://mvnrepository.com/artifact/org.apache.flink/flink-cep -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-cep</artifactId>
+            <version>1.20.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-api-java</artifactId>
+            <version>1.20.0</version>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.flink/flink-table-api-java-bridge -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-table-api-java-bridge</artifactId>
+            <version>1.20.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-oracle-cdc</artifactId>
+            <version>3.2.1</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-orc</artifactId>
+            <version>1.20.0</version>
+        </dependency>
+    </dependencies>
+
+
+    <build>
+        <sourceDirectory>src/main/scala</sourceDirectory>
+        <resources>
+            <resource>
+                <!-- 指定resources插件处理哪个目录下的资源文件 -->
+                <directory>src/main/resources</directory>
+            </resource>
+        </resources>
+
+        <plugins>
+            <!--第一个plugin：添加编译的支持，都编译成java1.8的版本-->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.6.1</version>
+                <configuration>
+                    <source>1.8</source>
+                    <target>1.8</target>
+                    <encoding>utf8</encoding>
+                </configuration>
+            </plugin>
+
+
+            <!--第二个plugin：添加scala编译的支持-->
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>3.2.2</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>
+                            <goal>testCompile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <scalaVersion>${scala.version}</scalaVersion>
+                    <args>
+                        <arg>-target:jvm-1.8</arg>
+                    </args>
+                    <jvmArgs>
+                        <!--Xss表示每个线程的堆栈大小-->
+                        <jvmArg>-Xss2048K</jvmArg>
+                        <!--Xms表示jvm初始化内存，无默认值-->
+                        <jvmArg>-Xms64m</jvmArg>
+                        <!--Xmx表示jvm最大可以用1024m的内存，默认为256 MB-->
+                        <jvmArg>-Xmx1024m</jvmArg>
+
+                    </jvmArgs>
+                </configuration>
+            </plugin>
+            <!--第三个plugin：添加打jar包的支持工具-->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>3.0.0</version>
+                <executions>
+                    <!--在应用maven package这个阶段的时候，该插件启动-->
+                    <execution>
+                        <id>make-assembly</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <!--<archive>-->
+                        <!--&lt;!&ndash;在jar包中指定启动类&ndash;&gt;-->
+                        <!--<manifest>-->
+                            <!--<mainClass>ai.h2o.automl.PredictMyData</mainClass>-->
+                        <!--</manifest>-->
+                    <!--</archive>-->
+                    <descriptorRefs>jar-with-dependencies</descriptorRefs>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
