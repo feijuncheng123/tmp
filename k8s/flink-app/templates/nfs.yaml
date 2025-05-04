@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink-app
+  template:
+    metadata:
+      labels:
+        app: flink-app
+    spec:
+      containers:
+      - name: flink
+        image: flink
+        volumeMounts:
+        - name: wwwroot
+          mountPath: /usr/share/checkpoint  #容器内挂载路径
+        ports:
+        - containerPort: 80
+      volumes:
+        - name: wwwroot
+          nfs:
+            server: 192.168.0.3  #这是nfs下的缺点
+            path: /data/nfs  #node路径

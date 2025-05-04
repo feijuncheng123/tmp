@@ -69,6 +69,14 @@ kubectl create deployment nginx --image=nginx
 kubectl expose deployment nginx --port=80 --type=NodePort
 kubectl get pod,svc  #80:32131/TCP 。32131是对外暴露的端口
 #访问地址：http://NodeIP:32131.使用任意一个node节点ip加上32131端口都能访问nginx主页
+kubectl delete deployment nginx #删除部署
+
+kubectl get namespace #获取命名空间。不同命名空间互相隔离。类似数据库
+#命名空间只能用于 Namespaced 资源（如 Pod、Service、Deployment），不能作用于非 namespaced 资源（如 Node、PersistentVolume）。
+
+#进入容器
+kubectl exec -it my-pod -c container2 -- bash
+
 
 #查看日志：
 journalctl -f -u kubelet.service  #-f为实时查看
@@ -81,6 +89,7 @@ kubectl describe pod xxx
 kubectl get nodes #（-o wide）加wide更详细
 #查看详细node情况
 kubectl describe node xxx
+
 
 
 #yaml编排文件生成（一般不用手写）
@@ -115,3 +124,103 @@ kubectl label -f pod.json status=unhealthy
 
 # 仅在资源版本为 1 且未更改时更新 Pod 'foo'
 kubectl label pods foo status=unhealthy --resource-version=1
+
+#ConfigMap:非加密配置
+kubectl create configmap flink-config --from-file=flink-config.yaml # 从flink的配置文件中生成configmap
+kubectl describe configmap flink-config
+#ConfigMap需要挂载
+
+
+#helm添加仓库：
+helm repo add stable http://mirror.azure.cn/kubernetes/charts/
+helm repo list #查看
+helm repo update #更新
+helm repo remove http://mirror.azure.cn/kubernetes/charts/ #删除
+
+
+#helm快速部署
+helm search repo mysql  #搜索镜像
+helm install stable/mysql  #安装搜索出来的image
+helm install status mysql #查看安装状态
+kubectl edit svc nginx #vim模式编辑yaml文件：type: ClusterIP修改为type: NodePort就可以对外暴露端口
+
+helm list -A #列出全部已安装charts
+helm history ingress-nginx -n ingress-nginx #列出具体charts操作历史
+
+helm show values repo/charts #列出特定repo下的charts可配置的值。
+helm get values charts -n namespace #列出已安装的charts可配置的值。
+
+#helm更新参数：
+#必须提供charts路径（或者repo/charts形式），否则很麻烦
+helm get values ingress-nginx -n ingress-nginx --all > my-values.yaml  #先导出现有配置进行修改
+helm upgrade ingress-nginx repo/ingress-nginx \  #此处repo/ingress-nginx也可以使用本地chart路径或者tgz包
+  -n ingress-nginx \
+  -f my-values.yaml #使用修改后配置进行升级
+
+
+#自定义charts
+helm create myCharts  #创建一个叫myCharts的charts模板，本地目录文件夹
+cd myCharts #进入myCharts
+#其中：
+#charts文件夹：为空，一般不用管
+#Charts.yaml文件记录chart基本信息、属性配置等
+#templates文件夹：包含pod的yaml文件，可以删掉，编写自己的yaml放进去
+#values.yaml：记录全局变量等内容
+cd templates
+rm -rf ./*
+kubectl create deployment flink-app --image=flink:1.20 -o yaml --dry-run  >> deployment.yaml 
+kubectl expose deployment flink-app --port=8081 --target-port=8081 --type=NodePort --dry-run -o yaml >> service.yaml
+
+#docker建立本地仓库：
+docker pull registry 
+docker run -d -p 5000:5000  -v /root/my-repo/:/var/lib/registry --privileged=true registry  #开启私有仓库
+
+#使用dockerfile构建镜像
+docker build -f /path/to/Dockerfile -t myimage:latest ./
+docker tag  flink-on-k8s-test:v1  192.168.0.3:5000/flink-on-k8s-test:v1  #重命名容器
+docker push localhost:5000/flink-on-k8s-test:v1  #推送到私有库
+
+helm install flink-app ./flink-app  #安装自定义charts
+helm upgrade flink-app ./flink-app #升级应用
+
+#helm动态部署
+#values.yaml定义变量，然后在yaml文件中捕获变量形成动态部署
+#在templates中的yaml文件中使用 {{ .values.image}} 获取相应变量. {{ .Release.Name}}可以获取发行版名称
+
+#持久化存储：
+yum install nfs-utils  #需要在k8s 的nodes服务器上也安装nfs-utils
+#在nfs服务器上启动nfs
+systemctl start nfs
+
+#设置挂载路径
+vim /etc/exports #设置挂载路径
+#/data/nfs *(rw,no_root_squash)
+#挂载路径/data/nfs需创建
+#创建nfs.yaml文件进行映射
+
+#使用pv和pvc进行映射
+#直接使用nfs需要指定node ip会对外暴露，是缺点
+#使用pv和pvc分别映射解决：pv定义ip和相应路径和容量，用于管理。pvc应用中通过yaml定义匹配方式。
+
+
+#ingress
+#NodePort缺陷：可以从所有node的端口访问，导致每个端口在k8s集群中只能使用一次
+#实际使用中是使用域名+端口的形式
+#ingress作为服务统一入口，使用service关联一组pod：一个service下可能有多个pod。然后ingress作为入口，通过service发现pod
+#需要安装匹配置ingress-controller
+helm upgrade --install ingress-nginx ingress-nginx \
+  --repo https://kubernetes.github.io/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
+  --set controller.replicaCount=3 \
+  --set controller.service.type=LoadBalancer \
+  --set controller.hostnetwork=true
+#注意：ingress不是互斥关系，一般都需要同时配置。service暴露pod（通常是 ClusterIP 类型），ingress把对域名的请求转发到该service上
+kubectl get ingressclass #获取已部署的ingress-controller名称
+
+#服务中的ingress.yaml文件中，host域名必须配置映射到ingress-controller运行的node节点ip中，否则无法访问
+#ingress-controller可以多副本部署，这样分布在不同node上，就可以进行负载均衡
+kubectl describe deployment ingress-nginx-controller -n ingress-nginx #查看ingress-nginx-controller详细信息，包括副本数
+
+#在部署的应用chart中添加ingress.yaml文件配置host和映射的服务和端口
+
+kubectl logs mypod #log的输出日志

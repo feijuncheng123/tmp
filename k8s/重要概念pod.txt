@@ -18,3 +18,7 @@ pod实现机制：
 1、NoSchelule: 该node一定不被调度
 2、preferNoSchelule: 尽量不被调度
 3、NoExecute： 不会调度，并且还会驱逐该node已有的pod
+
+
+默认情况下，调度器会尝试将多副本 Pod 尽可能均匀地分布到不同的 Node 上，但并不保证绝对平均。
+可以通过affinity配置调度，推荐使用topologySpreadConstraints调度，这个策略控制 Pod 尽量平均分布在不同的 hostname 上。
