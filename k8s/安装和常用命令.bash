@@ -128,8 +128,22 @@ kubectl label pods foo status=unhealthy --resource-version=1
 #ConfigMap:非加密配置
 kubectl create configmap flink-config --from-file=flink-config.yaml # 从flink的配置文件中生成configmap
 kubectl describe configmap flink-config
-#ConfigMap需要挂载
+#ConfigMap本身并不会主动生效，需要通过 Pod 显式地“挂载”或“引用”到容器中，才会对应用起作用。
+#1、可以通过键值对挂载：
+envFrom:
+- configMapRef:
+    name: my-config
+#2、通过volume挂载：
+volumes:
+- name: config-volume
+  configMap:
+    name: my-config
 
+containers:
+- name: myapp
+  volumeMounts:
+  - name: config-volume
+    mountPath: /etc/myapp/
 
 #helm添加仓库：
 helm repo add stable http://mirror.azure.cn/kubernetes/charts/
@@ -224,3 +238,18 @@ kubectl describe deployment ingress-nginx-controller -n ingress-nginx #查看ing
 #在部署的应用chart中添加ingress.yaml文件配置host和映射的服务和端口
 
 kubectl logs mypod #log的输出日志
+
+
+#StatefulSet:有状态运用
+#需要部署一个无头的service（clusterIP: None），使各个pod能够在集群内互相发现
+#启动的pod会有顺序启动，同时会对每个pod创建唯一主机名和域名，形式如下：
+#主机名：应用名-0  会根据顺序逐渐增加尾缀数字
+#域名：主机名.service名.命名空间.svc.cluster.local
+
+#StatefulSet部署可以让flink支持Local Recovery：
+#需要进行本地路径挂载设置：
+#1、process.taskmanager.working-dir: /pv    设置每个taskmanager的工作目录
+#2、containers中将/pv路径挂载name: pv   mountPath: /pv
+#3、通过pvc文件或者（volumeClaimTemplates.name: pv）申明挂载
+#在恢复时，statefulset会给每个pod创建和之前一样的唯一的名称
+#这些pod从挂载路径中根据自己的主机名读取相应checkpoint继续处理，实现Local Recovery
