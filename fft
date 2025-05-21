@@ -1,0 +1,70 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import entropy
+from scipy.spatial.distance import cosine
+
+# 模拟时间序列数据：前半周期性，后半周期消失
+np.random.seed(42)
+N = 1000
+t = np.arange(N)
+signal = np.sin(2 * np.pi * t / 50) * (t < 600) + np.random.normal(0, 0.2, N)
+
+# 滑动窗口参数
+window_size = 128
+step_size = 10
+
+# 存储检测结果
+anomaly_scores = []
+positions = []
+
+# 定义参考频谱（取前期正常段的平均频谱）
+ref_windows = [signal[i:i+window_size] for i in range(0, 300, step_size)]
+ref_ps_list = []
+for win in ref_windows:
+    fft_vals = np.fft.rfft(win * np.hanning(len(win)))
+    power_spectrum = np.abs(fft_vals) ** 2
+    ref_ps_list.append(power_spectrum / np.sum(power_spectrum))
+ref_ps_mean = np.mean(ref_ps_list, axis=0)
+
+# 滑动窗口检测
+for i in range(0, N - window_size, step_size):
+    window = signal[i:i+window_size]
+    window = window - np.mean(window)
+    fft_vals = np.fft.rfft(window * np.hanning(len(window)))
+    power_spectrum = np.abs(fft_vals) ** 2
+    total_energy = np.sum(power_spectrum)
+
+    # 主频强度
+    main_freq_idx = np.argmax(power_spectrum[1:]) + 1
+    periodicity_score = power_spectrum[main_freq_idx] / total_energy
+
+    # 频谱熵
+    ps_norm = power_spectrum / total_energy
+    spectral_entropy = entropy(ps_norm)
+
+    # 与参考频谱的余弦距离
+    cosine_dist = cosine(ps_norm, ref_ps_mean)
+
+    # 综合异常分数（越高越异常）
+    score = (1 - periodicity_score) + spectral_entropy + cosine_dist
+    anomaly_scores.append(score)
+    positions.append(i + window_size // 2)
+
+# 标准化分数
+anomaly_scores = np.array(anomaly_scores)
+anomaly_scores = (anomaly_scores - anomaly_scores.min()) / (anomaly_scores.max() - anomaly_scores.min())
+
+# 可视化
+fig, ax = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+ax[0].plot(t, signal, label="Signal")
+ax[0].set_ylabel("Value")
+ax[0].legend()
+
+ax[1].plot(positions, anomaly_scores, color='r', label="Anomaly Score")
+ax[1].axhline(0.6, color='gray', linestyle='--', label="Threshold")
+ax[1].set_ylabel("Anomaly Score")
+ax[1].set_xlabel("Time")
+ax[1].legend()
+
+plt.tight_layout()
+plt.show()
