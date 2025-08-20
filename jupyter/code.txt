@@ -45,30 +45,7 @@ future_exog_new = torch.tensor([[11.0]]).unsqueeze(2)  # (1,1,1)
 prediction = model(past_input, future_exog_new)
 print("预测值:", prediction.item())
 
-
-
-import torch
-import torch.nn as nn
-import numpy as np
-import math
-
-# 位置编码
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
-    
-    def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
-        return x
-
-
+-------------------------------------------------------------
 import torch
 import torch.nn as nn
 import numpy as np
@@ -161,7 +138,7 @@ print(f"Loss: {loss.item():.4f}")
 pred_inference = model(batch_inputs, batch_masks, inference=True)
 print(f"Inference shape: {pred_inference.shape}")
 
-
+-------------------------------------------------------------
 import torch
 import torch.nn as nn
 import numpy as np
@@ -265,7 +242,7 @@ print(f"Loss: {loss.item():.4f}")
 pred_inference = model(batch_inputs, batch_future_cov, inference=True)  # [32, 12, 7]
 print(f"Inference shape: {pred_inference.shape}")
 
-
+-------------------------------------------------------------
 import torch
 import torch.nn as nn
 import numpy as np
