@@ -1,0 +1,332 @@
+import torch
+import torch.nn as nn
+import numpy as np
+
+# 假设数据同上，转换为tensor
+y = torch.tensor(y.astype(np.float32))
+exog = torch.tensor(exog.astype(np.float32))
+
+# Encoder-Decoder模型
+class EncoderDecoderLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.encoder = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.decoder = nn.LSTM(1, hidden_dim, batch_first=True)  # Decoder输入exog_dim=1
+        self.fc = nn.Linear(hidden_dim, output_dim)
+    
+    def forward(self, past_input, future_exog):
+        # past_input: (batch, seq_len_past, features) 如(y + exog_past)
+        _, (hidden, cell) = self.encoder(past_input)
+        # future_exog: (batch, seq_len_future, exog_dim)
+        decoder_out, _ = self.decoder(future_exog, (hidden, cell))
+        output = self.fc(decoder_out[:, -1, :])  # 取最后输出
+        return output
+
+# 数据准备示例（batch=1, past_len=7, future_len=1, features=2）
+past_input = torch.stack((y[:7], exog[:7]), dim=1).unsqueeze(0)  # (1,7,2)
+future_exog = exog[7:8].unsqueeze(0).unsqueeze(2)  # (1,1,1)
+target = y[7:8]
+
+# 实例化模型
+model = EncoderDecoderLSTM(input_dim=2, hidden_dim=50, output_dim=1)
+optimizer = torch.optim.Adam(model.parameters())
+criterion = nn.MSELoss()
+
+# 训练（简化）
+for epoch in range(200):
+    optimizer.zero_grad()
+    output = model(past_input, future_exog)
+    loss = criterion(output, target.unsqueeze(1))
+    loss.backward()
+    optimizer.step()
+
+# 预测：提供未来exog
+future_exog_new = torch.tensor([[11.0]]).unsqueeze(2)  # (1,1,1)
+prediction = model(past_input, future_exog_new)
+print("预测值:", prediction.item())
+
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+import math
+
+# 位置编码
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return x
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+
+# 数据准备（模拟，包含缺失值）
+def create_samples(data, window_size=2016, target_size=288):
+    inputs, targets, masks = [], [], []
+    for i in range(0, len(data) - window_size - target_size + 1):
+        input_seq = data[i:i+window_size]
+        target_seq = data[i+window_size:i+window_size+target_size]
+        # 生成掩码（1=缺失，0=正常）
+        mask = np.isnan(input_seq).astype(np.float32)  # [2016, 7]
+        input_seq = np.nan_to_num(input_seq, nan=0.0)  # 替换 NaN 为 0
+        inputs.append(input_seq)
+        targets.append(target_seq)
+        masks.append(mask)
+    return (torch.tensor(inputs, dtype=torch.float32),
+            torch.tensor(targets, dtype=torch.float32),
+            torch.tensor(masks, dtype=torch.float32))
+
+# 模拟数据（带缺失值）
+data = np.random.randn(2304, 7)
+data[np.random.rand(*data.shape) < 0.1] = np.nan  # 10% 缺失
+inputs, targets, masks = create_samples(data)
+
+# LSTM 带掩码模型
+class LSTMWithMask(nn.Module):
+    def __init__(self, input_size=7, hidden_size=64, output_size=7, num_layers=1):
+        super().__init__()
+        self.input_embedding = nn.Linear(input_size, hidden_size)
+        self.mask_embedding = nn.Linear(input_size, hidden_size)  # 掩码嵌入
+        self.lstm = nn.LSTM(hidden_size * 2, hidden_size, num_layers=num_layers, batch_first=True)
+        self.decoder_lstm = nn.LSTM(hidden_size, hidden_size, num_layers=num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(0.2)
+    
+    def forward(self, x, mask, forecast_len=288, inference=False):
+        # x: [batch_size, 2016, 7], mask: [batch_size, 2016, 7]
+        # 嵌入输入和掩码
+        x_embed = self.input_embedding(x)  # [batch_size, 2016, hidden_size]
+        mask_embed = self.mask_embedding(mask)  # [batch_size, 2016, hidden_size]
+        combined = torch.cat([x_embed, mask_embed], dim=-1)  # [batch_size, 2016, hidden_size*2]
+        
+        # Encoder LSTM
+        encoder_out, (h_n, c_n) = self.lstm(combined)  # [batch_size, 2016, hidden_size]
+        encoder_out = self.dropout(encoder_out)
+        
+        if inference:
+            # 推理：逐步生成 288 步
+            outputs = []
+            dec_input = torch.zeros(x.size(0), 1, x.size(2)).to(x.device)  # [batch_size, 1, 7]
+            h, c = h_n, c_n
+            for _ in range(forecast_len):
+                dec_embed = self.input_embedding(dec_input)  # [batch_size, 1, hidden_size]
+                dec_out, (h, c) = self.decoder_lstm(dec_embed, (h, c))  # [batch_size, 1, hidden_size]
+                out = self.fc(dec_out.squeeze(1))  # [batch_size, 7]
+                outputs.append(out.unsqueeze(1))
+                dec_input = out.unsqueeze(1)  # 更新输入
+            return torch.cat(outputs, dim=1)  # [batch_size, 288, 7]
+        else:
+            # 训练：假设目标序列无缺失（或预处理）
+            outputs = []
+            dec_input = torch.zeros(x.size(0), 1, x.size(2)).to(x.device)
+            h, c = h_n, c_n
+            for t in range(forecast_len):
+                dec_embed = self.input_embedding(dec_input)
+                dec_out, (h, c) = self.decoder_lstm(dec_embed, (h, c))
+                out = self.fc(dec_out.squeeze(1))
+                outputs.append(out.unsqueeze(1))
+                dec_input = out.unsqueeze(1)  # 简化，实际可用真实目标
+            return torch.cat(outputs, dim=1)
+
+# 训练
+model = LSTMWithMask()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.MSELoss()
+
+batch_inputs = inputs[0:32]  # [32, 2016, 7]
+batch_targets = targets[0:32]  # [32, 288, 7]
+batch_masks = masks[0:32]  # [32, 2016, 7]
+optimizer.zero_grad()
+pred = model(batch_inputs, batch_masks)  # 训练
+loss = criterion(pred, batch_targets)
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪
+optimizer.step()
+print(f"Loss: {loss.item():.4f}")
+
+# 推理
+pred_inference = model(batch_inputs, batch_masks, inference=True)
+print(f"Inference shape: {pred_inference.shape}")
+
+
+# TFT-like Transformer
+class TFTLikeTransformer(nn.Module):
+    def __init__(self, input_size=7, future_cov_size=3, hidden_size=64, num_layers=2, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.input_embedding = nn.Linear(input_size, hidden_size)  # 历史输入嵌入
+        self.future_embedding = nn.Linear(future_cov_size, hidden_size)  # 未来协变量嵌入
+        self.pos_encoder = PositionalEncoding(hidden_size)
+        
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_heads, dropout=dropout)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=hidden_size, nhead=num_heads, dropout=dropout)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        
+        self.fc_out = nn.Linear(hidden_size, input_size)  # 输出 7 个特征
+    
+    def forward(self, src, future_cov, tgt=None, inference=False, forecast_len=12):
+        # src: 历史输入 [batch_size, historical_len, input_size=7]
+        # future_cov: 未来协变量 [batch_size, forecast_len=12, future_cov_size=3]
+        # tgt: 目标序列 [batch_size, forecast_len, input_size=7] (训练时用)
+        
+        # Encoder: 处理历史输入
+        src = self.input_embedding(src)  # [batch_size, historical_len, hidden_size]
+        src = self.pos_encoder(src.transpose(0, 1)).transpose(0, 1)
+        encoder_out = self.encoder(src.transpose(0, 1)).transpose(0, 1)  # [batch_size, historical_len, hidden_size]
+        
+        if inference:
+            # 推理模式：逐步生成
+            outputs = []
+            dec_input = torch.zeros(src.size(0), 1, src.size(2)).to(src.device)  # 初始 [batch_size, 1, hidden_size]
+            for t in range(forecast_len):
+                future_t = future_cov[:, t:t+1, :]  # 当前步的未来协变量 [batch_size, 1, 3]
+                future_embed = self.future_embedding(future_t)  # [batch_size, 1, hidden_size]
+                dec_input = dec_input + future_embed  # 注入未来协变量
+                
+                dec_input_pos = self.pos_encoder(dec_input.transpose(0, 1)).transpose(0, 1)
+                tgt_mask = nn.Transformer.generate_square_subsequent_mask(dec_input.size(1)).to(src.device)
+                dec_out = self.decoder(dec_input_pos.transpose(0, 1), encoder_out.transpose(0, 1), tgt_mask).transpose(0, 1)
+                out = self.fc_out(dec_out[:, -1, :])  # [batch_size, 7]
+                outputs.append(out.unsqueeze(1))
+                dec_input = torch.cat([dec_input, out.unsqueeze(1)], dim=1)  # 更新 dec_input
+            return torch.cat(outputs, dim=1)  # [batch_size, 12, 7]
+        
+        else:
+            # 训练模式：teacher forcing
+            future_embed = self.future_embedding(future_cov)  # [batch_size, 12, hidden_size]
+            tgt = self.input_embedding(tgt) + future_embed  # 注入未来协变量到目标序列
+            tgt = self.pos_encoder(tgt.transpose(0, 1)).transpose(0, 1)
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt.size(1)).to(src.device)
+            dec_out = self.decoder(tgt.transpose(0, 1), encoder_out.transpose(0, 1), tgt_mask).transpose(0, 1)
+            return self.fc_out(dec_out)  # [batch_size, 12, 7]
+
+# 数据准备（模拟）
+def create_samples(data, window_size=2016, target_size=12, future_cov_size=3):
+    inputs, targets, future_covs = [], [], []
+    for i in range(0, len(data) - window_size - target_size + 1):
+        inputs.append(data[i:i+window_size])  # [2016, 7]
+        targets.append(data[i+window_size:i+window_size+target_size])  # [12, 7]
+        future_covs.append(np.random.randn(target_size, future_cov_size))  # 模拟未来协变量 [12, 3]
+    return torch.tensor(inputs, dtype=torch.float32), torch.tensor(targets, dtype=torch.float32), torch.tensor(future_covs, dtype=torch.float32)
+
+data = np.random.randn(2304, 7)
+inputs, targets, future_covs = create_samples(data)
+
+# 模型和训练
+model = TFTLikeTransformer()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.MSELoss()
+
+batch_inputs = inputs[0:32]  # [32, 2016, 7]
+batch_targets = targets[0:32]  # [32, 12, 7]
+batch_future_cov = future_covs[0:32]  # [32, 12, 3]
+optimizer.zero_grad()
+pred = model(batch_inputs, batch_future_cov, batch_targets)  # 训练
+loss = criterion(pred, batch_targets)
+loss.backward()
+optimizer.step()
+print(f"Loss: {loss.item():.4f}")
+
+# 推理
+pred_inference = model(batch_inputs, batch_future_cov, inference=True)  # [32, 12, 7]
+print(f"Inference shape: {pred_inference.shape}")
+
+
+import torch
+import torch.nn as nn
+import numpy as np
+import math
+
+# 位置编码
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return x
+
+# Transformer 带掩码模型
+class TransformerWithMask(nn.Module):
+    def __init__(self, input_size=7, hidden_size=64, num_layers=2, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.input_embedding = nn.Linear(input_size, hidden_size)
+        self.mask_embedding = nn.Linear(input_size, hidden_size)  # 掩码嵌入
+        self.pos_encoder = PositionalEncoding(hidden_size)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_size, nhead=num_heads, dropout=dropout)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.decoder = nn.Linear(hidden_size, input_size)  # 简化：直接预测 288 步
+    
+    def forward(self, src, mask, forecast_len=288):
+        # src: [batch_size, 2016, 7], mask: [batch_size, 2016, 7]
+        # 替换 NaN 为 0
+        src = torch.where(mask == 1, torch.zeros_like(src), src)  # 缺失值设为 0
+        src_embed = self.input_embedding(src)  # [batch_size, 2016, hidden_size]
+        mask_embed = self.mask_embedding(mask)  # [batch_size, 2016, hidden_size]
+        src_embed = src_embed + mask_embed  # 注入掩码信息
+        
+        src_embed = self.pos_encoder(src_embed.transpose(0, 1)).transpose(0, 1)
+        # Attention Mask：缺失时间步权重设为 -inf
+        attn_mask = torch.zeros(src.size(1), src.size(1)).to(src.device)
+        attn_mask[mask.sum(dim=-1) > 0, :] = float('-inf')  # 缺失时间步屏蔽
+        encoder_out = self.encoder(src_embed.transpose(0, 1), mask=attn_mask).transpose(0, 1)
+        return self.decoder(encoder_out[:, -forecast_len:, :])  # [batch_size, 288, 7]
+
+# 数据准备（模拟缺失值）
+def create_samples(data, window_size=2016, target_size=288):
+    inputs, targets, masks = [], [], []
+    for i in range(0, len(data) - window_size - target_size + 1):
+        input_seq = data[i:i+window_size]
+        target_seq = data[i+window_size:i+window_size+target_size]
+        mask = np.isnan(input_seq).astype(np.float32)  # [2016, 7]
+        input_seq = np.nan_to_num(input_seq, nan=0.0)  # NaN 替换为 0
+        inputs.append(input_seq)
+        targets.append(target_seq)
+        masks.append(mask)
+    return (torch.tensor(inputs, dtype=torch.float32),
+            torch.tensor(targets, dtype=torch.float32),
+            torch.tensor(masks, dtype=torch.float32))
+
+data = np.random.randn(2304, 7)
+data[np.random.rand(*data.shape) < 0.1] = np.nan  # 10% 缺失
+inputs, targets, masks = create_samples(data)
+
+# 训练
+model = TransformerWithMask()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.MSELoss()
+
+batch_inputs = inputs[0:32]  # [32, 2016, 7]
+batch_targets = targets[0:32]  # [32, 288, 7]
+batch_masks = masks[0:32]  # [32, 2016, 7]
+optimizer.zero_grad()
+pred = model(batch_inputs, batch_masks)  # [32, 288, 7]
+loss = criterion(pred, batch_targets)
+loss.backward()
+optimizer.step()
+print(f"Loss: {loss.item():.4f}")
+
+
+from pytorchts.models import SAITS
+imputer = SAITS(input_size=7, hidden_size=64)
+data_imputed = imputer.fit_transform(data)  # 填充 NaN
