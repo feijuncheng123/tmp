@@ -1,0 +1,363 @@
+"""
+Time Series Shape Classification Demo
+=====================================
+
+This script provides a detailed, runnable demo for classifying time series into
+shape/categories such as: `flat_spiky`, `seasonal_wave`, `trending`, `volatile`,
+and the "mixed high-frequency envelope" type you described.
+
+Features extracted are lightweight and intended to be discriminative and fast:
+ - rolling short/long stds, pct_time_stable
+ - CV, MAD based stats
+ - STL seasonal strength (if available)
+ - spectral peak ratio + dominant period
+ - peak counts & peak heights
+ - autocorrelation lag-1, slope, skewness, kurtosis
+ - envelope-related metrics for mixed sequences
+
+The demo includes:
+ - synthetic data generator for 5 classes
+ - feature extraction pipeline
+ - rule-based classifier (fast, interpretable)
+ - clustering (RobustScaler + PCA + KMeans) to explore automatic grouping
+ - simple supervised classifier (RandomForest) trained on rule labels (or manual labels)
+ - visualization utilities
+
+Usage:
+ - Run `python time_series_shape_classifier.py` to execute the demo with simulated data.
+ - Replace `simulate_*` calls with your real series loading (see `load_series_from_csvs` example)
+ - Tune thresholds in `rule_based_label` to fit your data distribution.
+
+Dependencies:
+  numpy, pandas, scipy, scikit-learn, statsmodels, matplotlib, joblib
+
+"""
+
+import math
+import numpy as np
+import pandas as pd
+from scipy.signal import find_peaks, periodogram
+from scipy.stats import kurtosis, skew
+from statsmodels.tsa.seasonal import STL
+from sklearn.preprocessing import RobustScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import joblib
+
+RNG = np.random.RandomState(42)
+
+# ---------------------------- Synthetic generators ----------------------------
+
+def simulate_flat_spiky(length=288*30, base=10.0, noise_std=0.05, spike_prob=0.001, spike_amp=3.0):
+    x = np.ones(length) * base + RNG.normal(scale=noise_std, size=length)
+    spikes = RNG.rand(length) < spike_prob
+    x[spikes] += spike_amp * (1 + np.abs(RNG.randn(spikes.sum())))
+    return pd.Series(x)
+
+
+def simulate_seasonal_wave(length=288*30, points_per_day=288, amp=2.0, noise=0.2):
+    t = np.arange(length)
+    daily = amp * np.sin(2 * np.pi * (t % points_per_day) / points_per_day)
+    weekly = 0.5 * np.sin(2 * np.pi * (t / (points_per_day*7)))
+    x = 10 + daily + weekly + RNG.normal(scale=noise, size=length)
+    return pd.Series(x)
+
+
+def simulate_trending(length=288*30, slope=0.0005, noise=0.2):
+    t = np.arange(length)
+    trend = slope * t
+    seasonal = 1.5 * np.sin(2 * np.pi * (t % 288) / 288)
+    x = 10 + trend + seasonal + RNG.normal(scale=noise, size=length)
+    return pd.Series(x)
+
+
+def simulate_volatile(length=288*30, base=10.0, noise_std=1.0):
+    x = base + RNG.normal(scale=noise_std, size=length)
+    return pd.Series(x)
+
+
+def simulate_mixed_envelope(length=288*30, points_per_day=288, low_amp=3.0, high_freq_vals=(10,20)):
+    # low-frequency envelope: weekly-ish wave
+    t = np.arange(length)
+    envelope = 100 + low_amp * np.sin(2 * np.pi * (t / (points_per_day*7)))
+    # high-frequency alternating pattern: jump between two levels with short memory
+    hf = np.zeros(length)
+    state = 0
+    p_switch = 0.15
+    for i in range(length):
+        if RNG.rand() < p_switch:
+            state = 1 - state
+        hf[i] = high_freq_vals[state] + RNG.normal(scale=0.5)
+    # combine: envelope multiplies or adds depending on scenario; we add for stability
+    x = envelope + hf
+    return pd.Series(x)
+
+
+# ---------------------------- Feature extraction ----------------------------
+
+
+def rolling_mad(series, window):
+    # median absolute deviation, convert to approximate std by factor 1.4826
+    med = series.rolling(window, center=True, min_periods=1).median()
+    mad = (series - med).abs().rolling(window, center=True, min_periods=1).median()
+    return mad * 1.4826
+
+
+def spectral_features(series, points_per_day=288):
+    # returns (dominant_period_hours, peak_ratio)
+    x = series.values
+    n = len(x)
+    if n < 4:
+        return np.nan, 0.0
+    f, Pxx = periodogram(x)
+    # ignore the zero frequency
+    if len(Pxx) < 3:
+        return np.nan, 0.0
+    Pxx[0] = 0
+    idx = np.argmax(Pxx)
+    peak_power = Pxx[idx]
+    total_power = Pxx.sum() + 1e-12
+    peak_ratio = peak_power / total_power
+    # convert frequency f[idx] (cycles per sample) to period in hours
+    if f[idx] <= 0:
+        dominant_period_hours = np.nan
+    else:
+        period_in_samples = 1.0 / f[idx]
+        dominant_period_hours = (period_in_samples / points_per_day) * 24.0
+    return dominant_period_hours, peak_ratio
+
+
+def seasonal_strength_via_stl(series, period):
+    try:
+        stl = STL(series, period=period, robust=True).fit()
+        seasonal = stl.seasonal
+        resid = stl.resid
+        strength = max(0.0, 1 - (resid.var() / ((seasonal + resid).var() + 1e-12)))
+        return strength
+    except Exception:
+        return 0.0
+
+
+def extract_features(series, points_per_day=288, short_w=12, long_w=288):
+    s = pd.Series(series).dropna().astype(float)
+    n = len(s)
+    res = {}
+    # basic stats
+    res['mean'] = s.mean()
+    res['median'] = s.median()
+    res['std'] = s.std()
+    res['mad'] = np.median(np.abs(s - s.median())) * 1.4826
+    res['cv'] = res['std'] / (abs(res['mean']) + 1e-12)
+    # rolling stds
+    rshort = s.rolling(short_w, center=True, min_periods=1).std()
+    rlong = s.rolling(long_w, center=True, min_periods=1).std()
+    res['rshort_med'] = np.nanmedian(rshort)
+    res['rlong_med'] = np.nanmedian(rlong)
+    # pct time stable (short window)
+    pct_stable = (rshort < (res['std'] * 0.2)).mean()
+    res['pct_time_stable'] = float(pct_stable)
+    # spectral
+    dom_period_h, peak_ratio = spectral_features(s, points_per_day)
+    res['dominant_period_h'] = dom_period_h if dom_period_h is not None else np.nan
+    res['spectral_peak_ratio'] = peak_ratio
+    # seasonal strength
+    res['seasonal_strength'] = seasonal_strength_via_stl(s, period=points_per_day)
+    # peaks
+    median_b = res['median']
+    robust_std = max(res['mad'], res['std'])
+    thresh = median_b + 3 * robust_std
+    peaks, props = find_peaks(s.values, height=thresh)
+    res['num_peaks'] = len(peaks)
+    res['peaks_per_day'] = len(peaks) / (n / points_per_day)
+    res['max_peak_ratio'] = (props['peak_heights'].max() / (median_b + 1e-12)) if len(peaks) > 0 else 0.0
+    # acf lag1
+    try:
+        res['acf1'] = s.autocorr(lag=1)
+    except Exception:
+        res['acf1'] = 0.0
+    # slope
+    x = np.arange(n)
+    A = np.vstack([x, np.ones(n)]).T
+    slope = np.linalg.lstsq(A, s.values, rcond=None)[0][0]
+    res['slope'] = slope
+    # moments
+    res['kurtosis'] = kurtosis(s, fisher=False, nan_policy='omit')
+    res['skew'] = skew(s, nan_policy='omit')
+    # envelope features (for mixed-type detection)
+    w_env = int(points_per_day / 24) * 6 if points_per_day >= 24 else max(3, int(points_per_day/24))
+    # ensure window not too small
+    w_env = max(3, min(w_env, int(n/10)))
+    env = s.rolling(window=w_env, center=True, min_periods=1).median()
+    resid = s - env
+    res['env_std'] = env.std()
+    res['resid_std'] = resid.std()
+    res['env_resid_ratio'] = (res['resid_std'] + 1e-12) / (res['env_std'] + 1e-12)
+    # energy split: how much power in low freq vs high freq
+    # approximate: rlong vs rshort
+    res['short_long_std_ratio'] = (res['rshort_med'] + 1e-12) / (res['rlong_med'] + 1e-12)
+    return res
+
+
+def batch_extract_features(series_dict, points_per_day=288):
+    rows = []
+    for sid, series in series_dict.items():
+        feats = extract_features(series, points_per_day=points_per_day)
+        feats['id'] = sid
+        rows.append(feats)
+    df = pd.DataFrame(rows).set_index('id')
+    return df
+
+
+# ---------------------------- Rule-based classifier ----------------------------
+
+def rule_based_label(feat_row):
+    # Order matters: check stable+spike first, then seasonal, trending, volatile, mixed
+    # thresholds are conservative defaults; tune for your data
+    if feat_row['pct_time_stable'] > 0.7 and feat_row['peaks_per_day'] > 0.05 and feat_row['max_peak_ratio'] > 2.5:
+        return 'flat_spiky'
+    if feat_row['seasonal_strength'] > 0.5 and feat_row['spectral_peak_ratio'] > 0.15:
+        return 'seasonal_wave'
+    if abs(feat_row['slope']) > 0.002 * max(abs(feat_row['median']), 1):
+        return 'trending'
+    if feat_row['cv'] > 0.3 or feat_row['rlong_med'] > 1.5 * feat_row['rshort_med']:
+        # high total variance or long-term variance much higher
+        return 'volatile'
+    # mixed/high-frequency envelope: short-term resid large but envelope exists
+    if feat_row['env_resid_ratio'] > 0.8 and feat_row['seasonal_strength'] > 0.2 and feat_row['short_long_std_ratio'] > 1.5:
+        return 'mixed_envelope'
+    # fallback
+    return 'other'
+
+
+# ---------------------------- Clustering / Classifier pipeline ----------------------------
+
+def cluster_and_inspect(feat_df, n_clusters=5, random_state=42):
+    cols = feat_df.columns.tolist()
+    scaler = RobustScaler()
+    Xs = scaler.fit_transform(feat_df.values)
+    pca = PCA(n_components=min(6, Xs.shape[1]))
+    Xp = pca.fit_transform(Xs)
+    km = KMeans(n_clusters=n_clusters, random_state=random_state)
+    labs = km.fit_predict(Xp)
+    return labs, scaler, pca, km
+
+
+def train_supervised_classifier(X, y):
+    rf = RandomForestClassifier(n_estimators=200, random_state=42)
+    rf.fit(X, y)
+    return rf
+
+
+# ---------------------------- Visualization ----------------------------
+
+def plot_series_with_label(series, label, features=None, points_to_show=1440):
+    plt.figure(figsize=(12,4))
+    series.tail(points_to_show).plot(alpha=0.8)
+    plt.title(f'ID sample - label={label}')
+    if features is not None:
+        txt = '\n'.join([f'{k}={v:.3g}' for k,v in features.items() if isinstance(v,(int,float))][:8])
+        plt.gca().text(0.01, 0.02, txt, transform=plt.gca().transAxes, fontsize=9,
+                       bbox=dict(facecolor='white', alpha=0.6))
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------------- Demo / main flow ----------------------------
+
+def demo_simulation_and_classification():
+    # simulate a small dataset with labeled types
+    n_each = 40
+    pts_day = 288
+    series_dict = {}
+    labels_gt = {}
+    idx = 0
+    for i in range(n_each):
+        series_dict[f'flat_{i}'] = simulate_flat_spiky(length=pts_day*30)
+        labels_gt[f'flat_{i}'] = 'flat_spiky'
+    for i in range(n_each):
+        series_dict[f'sea_{i}'] = simulate_seasonal_wave(length=pts_day*30, points_per_day=pts_day)
+        labels_gt[f'sea_{i}'] = 'seasonal_wave'
+    for i in range(n_each):
+        series_dict[f'trend_{i}'] = simulate_trending(length=pts_day*30)
+        labels_gt[f'trend_{i}'] = 'trending'
+    for i in range(n_each):
+        series_dict[f'vol_{i}'] = simulate_volatile(length=pts_day*30)
+        labels_gt[f'vol_{i}'] = 'volatile'
+    for i in range(n_each):
+        series_dict[f'mix_{i}'] = simulate_mixed_envelope(length=pts_day*30, points_per_day=pts_day)
+        labels_gt[f'mix_{i}'] = 'mixed_envelope'
+
+    print('Simulated series count:', len(series_dict))
+
+    # extract features
+    feat_df = batch_extract_features(series_dict, points_per_day=pts_day)
+    print('Features extracted:', feat_df.shape)
+
+    # rule labels
+    rule_labels = feat_df.apply(rule_based_label, axis=1)
+    feat_df['rule_label'] = rule_labels
+
+    # inspect confusion of rule labels vs ground truth
+    y_true = [labels_gt[i] for i in feat_df.index]
+    y_pred_rule = rule_labels.values
+    print('\nRule-based classifier report (on simulated data used to develop rules):')
+    print(classification_report(y_true, y_pred_rule, zero_division=0))
+
+    # clustering to inspect latent groups
+    labs, scaler, pca, km = cluster_and_inspect(feat_df.drop(columns=['rule_label']), n_clusters=5)
+    feat_df['cluster'] = labs
+
+    # train a supervised classifier to emulate the rule-based logic (for fast online usage)
+    X = scaler.transform(feat_df.drop(columns=['rule_label','cluster']).values)
+    rf = train_supervised_classifier(X, feat_df['rule_label'].values)
+
+    # evaluate RF
+    y_rf = rf.predict(X)
+    print('\nSupervised RF on training set (imitating rules):')
+    print(classification_report(feat_df['rule_label'].values, y_rf, zero_division=0))
+
+    # plot examples per predicted class
+    sample_ids = {}
+    for lab in sorted(feat_df['rule_label'].unique()):
+        sample = feat_df[feat_df['rule_label'] == lab].sample(1, random_state=42).index[0]
+        sample_ids[lab] = sample
+
+    for lab, sid in sample_ids.items():
+        print('\nPlotting sample for class', lab, '->', sid)
+        plot_series_with_label(series_dict[sid], lab, features=feat_df.loc[sid].to_dict(), points_to_show=288*3)
+
+    # save artifact (scaler + rf) for online use
+    joblib.dump({'scaler': scaler, 'pca': pca, 'kmeans': km, 'rf': rf}, 'ts_shape_pipeline.joblib')
+    print('\nSaved pipeline to ts_shape_pipeline.joblib')
+
+    return feat_df, series_dict
+
+
+# ---------------------------- Helper for real data --------------------------------
+
+def load_series_from_csvs(filepaths, value_col='value', parse_dates=True):
+    # filepaths: dict of id->path or list
+    out = {}
+    if isinstance(filepaths, dict):
+        items = filepaths.items()
+    else:
+        items = [(p, p) for p in filepaths]
+    for sid, path in items:
+        df = pd.read_csv(path)
+        if parse_dates and 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp')
+        series = pd.Series(df[value_col].values)
+        out[sid] = series
+    return out
+
+
+if __name__ == '__main__':
+    feat_df, series_dict = demo_simulation_and_classification()
+    # show aggregated features head
+    print('\nFeature sample:')
+    print(feat_df.head())
+
