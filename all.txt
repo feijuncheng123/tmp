@@ -1,0 +1,299 @@
+# Dask Helm Chart (single-image pattern)
+
+This chart packages a Dask scheduler, worker Deployment and a CronJob that runs a job container which connects to the scheduler. It assumes you have built a Docker image that contains your code and Dask runtime.
+
+---
+
+## File layout (this document contains all files below)
+
+```
+Chart.yaml
+values.yaml
+templates/_helpers.tpl
+templates/scheduler-deployment.yaml
+templates/scheduler-service.yaml
+templates/worker-deployment.yaml
+templates/cronjob.yaml
+templates/notes.txt
+```
+
+---
+
+## Chart.yaml
+
+```yaml
+apiVersion: v2
+name: dask-cluster
+description: A simple Helm chart to deploy Dask scheduler, workers and CronJob that runs a job
+type: application
+version: 0.1.0
+appVersion: "2025.1"
+```
+
+---
+
+## values.yaml
+
+```yaml
+image:
+  repository: myregistry.example.com/my-dask-image
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 10 # workers
+
+scheduler:
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+worker:
+  replicas: 10
+  args: ["--nthreads", "1", "--memory-limit", "10GB"]
+  resources:
+    requests:
+      cpu: "8"
+      memory: "10Gi"
+    limits:
+      cpu: "8"
+      memory: "10Gi"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+cronjob:
+  enabled: true
+  # cron schedule: use standard cron expression (in Kubernetes timezone - default is cluster timezone / UTC)
+  schedule: "0 */10 * * *" # example: every day at hours 0,10,20 (cron-style). For "every 10 hours from job start" use a different approach.
+  concurrencyPolicy: "Allow"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  # The command to run your job container. Example uses python to execute /app/my_code.py
+  command: ["python", "/app/my_code.py"]
+
+service:
+  type: ClusterIP
+  port: 8786
+  dashboardPort: 8787
+
+podSecurityContext: {}
+securityContext: {}
+
+# Extra envs for job or worker
+extraEnv: []
+
+# Scheduler service DNS that the job should use to connect. Helm will create the service name dask-cluster-scheduler
+schedulerHost: "dask-cluster-scheduler"
+schedulerPort: 8786
+
+# labels/annotations
+labels: {}
+annotations: {}
+```
+
+---
+
+## templates/\_helpers.tpl
+
+```gotpl
+{{- define "dask.fullname" -}}
+{{- printf "%s" .Release.Name -}}
+{{- end -}}
+```
+
+---
+
+## templates/scheduler-deployment.yaml
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dask.fullname" . }}-scheduler
+  labels:
+    app: {{ include "dask.fullname" . }}
+    component: scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "dask.fullname" . }}
+      component: scheduler
+  template:
+    metadata:
+      labels:
+        app: {{ include "dask.fullname" . }}
+        component: scheduler
+    spec:
+      containers:
+        - name: scheduler
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["dask-scheduler"]
+          ports:
+            - containerPort: {{ .Values.service.port }}
+              name: tcp-scheduler
+            - containerPort: {{ .Values.service.dashboardPort }}
+              name: dashboard
+          resources:
+            requests:
+              cpu: {{ .Values.scheduler.resources.requests.cpu }}
+              memory: {{ .Values.scheduler.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.scheduler.resources.limits.cpu }}
+              memory: {{ .Values.scheduler.resources.limits.memory }}
+```
+
+---
+
+## templates/scheduler-service.yaml
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dask.fullname" . }}-scheduler
+  labels:
+    app: {{ include "dask.fullname" . }}
+    component: scheduler
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ include "dask.fullname" . }}
+    component: scheduler
+  ports:
+    - name: tcp-scheduler
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+    - name: dashboard
+      port: {{ .Values.service.dashboardPort }}
+      targetPort: {{ .Values.service.dashboardPort }}
+```
+
+---
+
+## templates/worker-deployment.yaml
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dask.fullname" . }}-worker
+  labels:
+    app: {{ include "dask.fullname" . }}
+    component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "dask.fullname" . }}
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: {{ include "dask.fullname" . }}
+        component: worker
+    spec:
+      nodeSelector: {{ toJson .Values.worker.nodeSelector | nindent 6 }}
+      tolerations: {{ toJson .Values.worker.tolerations | nindent 6 }}
+      affinity: {{ toJson .Values.worker.affinity | nindent 6 }}
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["dask-worker", "tcp://{{ .Values.schedulerHost }}:{{ .Values.schedulerPort }}"]
+          # append extra args from values (e.g. nthreads, memory-limit)
+          {{- if .Values.worker.args }}
+          args: ["dask-worker", "tcp://{{ .Values.schedulerHost }}:{{ .Values.schedulerPort }}", {{- range $i, $a := .Values.worker.args }}"{{ $a }}"{{ if ne (add $i 1) (len .Values.worker.args) }}, {{ end }}{{- end }}]
+          {{- end }}
+          resources:
+            requests:
+              cpu: {{ .Values.worker.resources.requests.cpu }}
+              memory: {{ .Values.worker.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.worker.resources.limits.cpu }}
+              memory: {{ .Values.worker.resources.limits.memory }}
+          env:
+            - name: DASK_SCHEDULER_ADDRESS
+              value: "tcp://{{ .Values.schedulerHost }}:{{ .Values.schedulerPort }}"
+            {{- range .Values.extraEnv }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+```
+
+---
+
+## templates/cronjob.yaml
+
+```yaml
+{{- if .Values.cronjob.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "dask.fullname" . }}-job
+  labels:
+    app: {{ include "dask.fullname" . }}
+    component: job
+spec:
+  schedule: "{{ .Values.cronjob.schedule }}"
+  concurrencyPolicy: {{ .Values.cronjob.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: {{ toJson .Values.cronjob.command }}
+              env:
+                - name: DASK_SCHEDULER_ADDRESS
+                  value: "tcp://{{ include "dask.fullname" . }}-scheduler:{{ .Values.schedulerPort }}"
+                - name: SCHEDULER_HOST
+                  value: "{{ include "dask.fullname" . }}-scheduler"
+                - name: SCHEDULER_PORT
+                  value: "{{ .Values.schedulerPort }}"
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "1Gi"
+                limits:
+                  cpu: "2"
+                  memory: "2Gi"
+```
+
+{{- end }}
+
+````
+
+---
+
+## templates/notes.txt
+
+```text
+To install the chart:
+
+1. Package or reference the chart directory and install:
+
+   helm install my-dask ./dask-cluster -f values.yaml
+
+2. Check scheduler and worker pods:
+
+   kubectl get pods -l app=my-dask
+   kubectl get svc -l app=my-dask
+
+3. Your CronJob will be created (if enabled).
+
+Notes:
+- The chart uses a single image for scheduler/worker/job; the entrypoint in the image should support running 'dask-scheduler' or 'dask-worker' or Python command as used in the CronJob.
+- Adjust resources, nodeSelector and tolerations for your cluster.
+- If you want autoscaling, consider integration with HorizontalPodAutoscaler and Dask's adaptive cluster setup.
+````
