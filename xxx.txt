@@ -1,0 +1,196 @@
+# joint_student_t_lgb.py (experimental)
+import numpy as np
+import lightgbm as lgb
+from scipy.special import digamma
+from scipy.stats import t
+from scipy.optimize import minimize
+
+eps = 1e-9
+
+def student_t_obj(preds, train_data):
+    # preds is a 1D numpy array of length 3*n (concatenated: mu_block | logsigma_block | eta_block)
+    # However, LightGBM will pass preds length == n by default; this concatenation trick
+    # relies on LightGBM updating preds with the same length as labels and expects
+    # custom objective to return arrays of that same length. Some users hack by passing
+    # Dataset with label length = 3*n and duplicates labels; that is brittle.
+    #
+    # Here we implement the vectorized gradients given preds is concatenated as expected.
+    y = train_data.get_label()
+    n = y.shape[0]
+    # Expect preds length = 3*n
+    if preds.shape[0] != 3*n:
+        raise ValueError("This objective expects preds length 3*n (mu|logsigma|eta). Got %d vs %d" % (preds.shape[0], 3*n))
+    mu = preds[0:n]
+    log_sigma = preds[n:2*n]
+    eta = preds[2*n:3*n]  # eta = log(nu - 2)
+    sigma = np.exp(log_sigma) + eps
+    nu = 2.0 + np.exp(eta)  # ensure nu>2
+    z = (y - mu) / sigma
+    tval = 1.0 + (z*z) / nu
+    B = (nu + 1.0) / nu
+
+    # grads
+    grad_mu = - B * z / (sigma * tval)         # dL/dmu
+    grad_log_sigma = 1.0 - B * (z*z) / tval    # dL/d(log sigma)
+
+    # dL/dnu (then chain to dL/deta)
+    term1 = 0.5 / nu
+    term2 = 0.5 * (digamma(nu/2.0) - digamma((nu+1.0)/2.0))
+    term3 = 0.5 * np.log(np.maximum(tval, eps))
+    term4 = - (nu + 1.0) * (z*z) / (2.0 * (nu*nu) * tval)
+    dL_dnu = term1 + term2 + term3 + term4
+    grad_eta = (nu - 2.0) * dL_dnu
+
+    # hessians
+    hess_mu = ( (nu + 1.0) / nu ) * (1.0 / (sigma*sigma)) * (1.0/tval - 2.0 * (z*z) / (nu * tval*tval))
+    hess_log_sigma = 2.0 * (nu + 1.0) / nu * (z*z) * (1.0/tval - (z*z) / (nu * tval*tval))
+
+    # for eta (nu param) we use a positive stable approximation for hessian
+    hess_eta = np.maximum(1e-6, np.abs(grad_eta) + 1e-6)
+
+    grad = np.concatenate([grad_mu, grad_log_sigma, grad_eta])
+    hess = np.concatenate([hess_mu, hess_log_sigma, hess_eta])
+    return grad, hess
+
+# Example training wrapper (VERY experimental!)
+def train_joint_model(X, y):
+    n = X.shape[0]
+    # Trick: we prepare a dataset with label repeated three times, and we will
+    # also provide 'init_score' of length 3*n to seed preds blocks. This is hacky.
+    # Many users instead choose to implement a custom boosting loop.
+    y_dup = np.concatenate([y, y, y])
+    dtrain = lgb.Dataset(X, label=y_dup)  # NOTE: this mismatches feature rows vs labels!
+    # This is intentionally sketch — most LightGBM versions expect label length == n,
+    # and using a label of length 3*n with X of n rows may error.
+    # If you want to experiment, one approach is to tile X vertically 3 times too:
+    X_trip = np.vstack([X, X, X])
+    dtrain = lgb.Dataset(X_trip, label=y_dup)
+    params = {'objective': 'regression', 'metric':'None', 'verbosity': -1}
+    bst = lgb.train(params, dtrain, fobj=student_t_obj, num_boost_round=200)
+    return bst
+
+
+
+
+import numpy as np
+import lightgbm as lgb
+from scipy.special import gammaln
+
+# =====================
+# 1. Student-t logPDF
+# =====================
+def student_t_logpdf(y, mu, sigma, nu):
+    """
+    计算 Student-t 对数似然 (逐点)
+    y: 实际值
+    mu: 预测均值
+    sigma: 尺度参数 > 0
+    nu: 自由度参数 > 0
+    """
+    z = (y - mu) / sigma
+    return (
+        gammaln((nu + 1) / 2)
+        - gammaln(nu / 2)
+        - 0.5 * np.log(nu * np.pi)
+        - np.log(sigma)
+        - (nu + 1) / 2 * np.log(1 + z**2 / nu)
+    )
+
+
+# =====================
+# 2. unpack预测向量
+# =====================
+def unpack_predictions(y_pred):
+    """
+    LightGBM 输出是一维向量，
+    我们假设每个样本有 3 个参数 (mu, log_sigma, log_nu)。
+    """
+    y_pred = y_pred.reshape(-1, 3)
+    mu = y_pred[:, 0]
+    log_sigma = y_pred[:, 1]
+    log_nu = y_pred[:, 2]
+    sigma = np.exp(log_sigma)
+    nu = np.exp(log_nu)
+    return mu, sigma, nu, log_sigma, log_nu
+
+
+# =====================
+# 3. 自定义目标函数 (grad + hess)
+# =====================
+def student_t_nll_loss(y_pred, dataset):
+    y_true = dataset.get_label()
+    mu, sigma, nu, log_sigma, log_nu = unpack_predictions(y_pred)
+
+    # 常用符号
+    z = (y_true - mu) / sigma
+    denom = 1 + (z**2) / nu
+
+    # ------- grad -------
+    # d/dmu
+    grad_mu = (nu + 1) * z / (nu * denom * sigma)
+
+    # d/dlog_sigma
+    grad_log_sigma = -1 + (nu + 1) * (z**2) / (nu * denom)
+
+    # d/dlog_nu (近似推导，确保数值稳定)
+    grad_log_nu = (
+        0.5 * (1 - (nu + 1) * (z**2) / (nu * denom))
+    )
+
+    grad = np.vstack([grad_mu, grad_log_sigma, grad_log_nu]).T.reshape(-1)
+
+    # ------- hess -------
+    # 为简化，这里返回一个近似的常数 hess（保证正定）
+    hess = np.ones_like(grad) * 0.1
+
+    return grad, hess
+
+
+# =====================
+# 4. 自定义评估函数 (NLL)
+# =====================
+def student_t_nll_eval(y_pred, dataset):
+    y_true = dataset.get_label()
+    mu, sigma, nu, _, _ = unpack_predictions(y_pred)
+    nll = -student_t_logpdf(y_true, mu, sigma, nu).mean()
+    return "student_t_nll", nll, False  # False = 越小越好
+
+
+# =====================
+# 5. 模拟训练数据
+# =====================
+np.random.seed(42)
+n = 2000
+x = np.linspace(0, 20, n)
+y = np.sin(x) + 0.3 * np.random.standard_t(df=3, size=n)  # 有脉冲噪声的sin波
+
+X_train = x[:1500].reshape(-1, 1)
+y_train = y[:1500]
+X_val = x[1500:].reshape(-1, 1)
+y_val = y[1500:]
+
+train_set = lgb.Dataset(X_train, label=y_train)
+val_set = lgb.Dataset(X_val, label=y_val)
+
+# =====================
+# 6. 训练模型
+# =====================
+params = {
+    "objective": "regression",
+    "metric": "None",  # 禁用默认 RMSE
+    "verbosity": -1,
+    "num_leaves": 31,
+    "learning_rate": 0.05,
+    "min_data_in_leaf": 20,
+}
+
+model = lgb.train(
+    params,
+    train_set,
+    valid_sets=[val_set],
+    fobj=student_t_nll_loss,   # 自定义损失
+    feval=student_t_nll_eval,  # 自定义评估
+    num_boost_round=2000,
+    early_stopping_rounds=50,
+    verbose_eval=50,
+)
