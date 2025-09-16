@@ -314,3 +314,13 @@ if __name__ == '__main__':
     # 显示几个点
     df_out = pd.DataFrame({'y':yte,'mu':mu_pred,'sigma':sigma_pred,'low':lower,'up':upper})
     print(df_out.head(10))
+
+要点与解释：
+
+我用 log(|resid|+ε) 作为 logσ 的代理回归目标（常用、稳健）。你也可以用 0.5*log(resid^2+ε)；两者等价到常数项。
+
+nu 我在训练集上做 MLE：先用 u=(y-μ)/σ 标准化残差，然后最小化 Student-t 的负对数似然求 ν（标量）。你也可以把 ν 设为超参并用 CV 调参。
+
+预测时直接用 scipy.stats.t.ppf 得到上下界。
+
+这个方案的优点：实现简单、数值稳定、易部署；缺点：ν 为全局或按窗口估计（如果你怀疑 ν 随时间变化，可以把 ν 在分段上估计或用小模型去预测 ν，但复杂度增大）。
