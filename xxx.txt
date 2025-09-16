@@ -194,3 +194,123 @@ model = lgb.train(
     early_stopping_rounds=50,
     verbose_eval=50,
 )
+
+# student_t_two_stage.py
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from scipy.stats import t
+from scipy.optimize import minimize
+from scipy.stats import median_abs_deviation
+
+# ---------------------------
+# 生成示例数据（你可替换为真实数据）
+# ---------------------------
+def gen_series(n=3000, seed=2025):
+    rng = np.random.RandomState(seed)
+    t_idx = np.arange(n)
+    base = 1000 + 20*np.sin(2*np.pi*t_idx/288)
+    noise = rng.normal(scale=3.0, size=n)
+    spikes = (rng.rand(n) < 0.002).astype(float) * (np.abs(rng.standard_t(df=3, size=n)) * 60)
+    y = base + noise + spikes
+    return pd.Series(y)
+
+# ---------------------------
+# 简单特征构造（示例）
+# ---------------------------
+def make_features(series, L=288, stride=1):
+    X_rows = []
+    y = []
+    idxs = []
+    n = len(series)
+    for start in range(0, n - L - 1, stride):
+        win = series.iloc[start:start+L].values
+        last = win[-1]
+        mean_1h = win[-12:].mean()
+        std_1h = win[-12:].std()
+        mean_6h = win[-72:].mean()
+        std_6h = win[-72:].std()
+        slope = np.polyfit(np.arange(len(win[-24:])), win[-24:], 1)[0]
+        X_rows.append([last, mean_1h, std_1h, mean_6h, std_6h, slope])
+        y.append(series.iloc[start+L])  # predict next point
+        idxs.append(series.index[start+L])
+    X = pd.DataFrame(X_rows, index=idxs,
+                     columns=['last','mean_1h','std_1h','mean_6h','std_6h','slope'])
+    y = pd.Series(y, index=idxs)
+    return X, y
+
+# ---------------------------
+# 估计全局 nu（MLE）给定标准化残差 u
+# ---------------------------
+def estimate_nu_mle(u, nu_init=5.0):
+    # negative log-likelihood of Student-t for samples u with scale=1 (we already standardized)
+    def nll(nu):
+        if nu <= 2.01:  # keep >2 for variance existence; guard
+            return 1e9
+        # using scipy t logpdf
+        return -np.sum(t.logpdf(u, df=nu, loc=0, scale=1.0))
+    res = minimize(lambda x: nll(x[0]), x0=np.array([nu_init]), bounds=[(2.01, 200.0)])
+    if res.success:
+        return float(res.x[0])
+    else:
+        return nu_init
+
+# ---------------------------
+# 主流程：训练 μ 模型、训练 logσ 模型、估计 ν、预测区间
+# ---------------------------
+def train_two_stage(X_train, y_train, X_valid=None, y_valid=None):
+    # 1) Model mu (L2 regression)
+    params = {'objective':'regression','metric':'l2','verbosity':-1,'num_leaves':31,'learning_rate':0.05}
+    dtrain = lgb.Dataset(X_train, label=y_train)
+    valid_sets = [dtrain]
+    if X_valid is not None:
+        dval = lgb.Dataset(X_valid, label=y_valid)
+        valid_sets = [dtrain, dval]
+    model_mu = lgb.train(params, dtrain, valid_sets=valid_sets, num_boost_round=100, early_stopping_rounds=20, verbose_eval=False)
+
+    # 2) compute residuals on training set
+    mu_hat_train = model_mu.predict(X_train)
+    resid = y_train.values - mu_hat_train
+    eps = 1e-6
+    s_target = np.log(np.abs(resid) + eps)  # target for log sigma regression
+
+    # 3) Train log_sigma model
+    dtrain_s = lgb.Dataset(X_train, label=s_target)
+    params_s = {'objective':'regression','metric':'l2','verbosity':-1,'num_leaves':31,'learning_rate':0.05}
+    model_logsigma = lgb.train(params_s, dtrain_s, num_boost_round=100, verbose_eval=False)
+
+    # 4) estimate nu on training normalized residuals using predicted sigma
+    sigma_hat_train = np.exp(model_logsigma.predict(X_train))
+    u_train = resid / (sigma_hat_train + 1e-9)
+    nu_hat = estimate_nu_mle(u_train, nu_init=5.0)
+    return model_mu, model_logsigma, nu_hat
+
+def predict_interval(model_mu, model_logsigma, nu, X, alpha=0.05):
+    mu = model_mu.predict(X)
+    logsigma = model_logsigma.predict(X)
+    sigma = np.exp(logsigma)
+    lower = t.ppf(alpha/2, df=nu, loc=mu, scale=sigma)
+    upper = t.ppf(1-alpha/2, df=nu, loc=mu, scale=sigma)
+    return mu, sigma, lower, upper
+
+# ---------------------------
+# 小测试/demo
+# ---------------------------
+if __name__ == '__main__':
+    s = gen_series( n=3000 )
+    X, y = make_features(s, L=288)
+    # time split
+    n_train = int(len(X)*0.7)
+    Xtr, Xte = X.iloc[:n_train], X.iloc[n_train:]
+    ytr, yte = y.iloc[:n_train], y.iloc[n_train:]
+
+    mu_model, logsigma_model, nu_hat = train_two_stage(Xtr, ytr, Xte, yte)
+    print("Estimated global nu:", nu_hat)
+
+    mu_pred, sigma_pred, lower, upper = predict_interval(mu_model, logsigma_model, nu_hat, Xte, alpha=0.05)
+    # 检查 coverage on test
+    coverage = np.mean((yte >= lower) & (yte <= upper))
+    print("Test coverage @95%:", coverage)
+    # 显示几个点
+    df_out = pd.DataFrame({'y':yte,'mu':mu_pred,'sigma':sigma_pred,'low':lower,'up':upper})
+    print(df_out.head(10))
