@@ -1,0 +1,298 @@
+"""
+ssqueezepy CWT/SST -> feature extraction pipeline for LightGBM
+Author: ChatGPT
+Description:
+  - Compute CWT/SST using ssqueezepy, extract robust time-series features useful for
+    volatility / uncertainty modelling and anomaly detection.
+  - Features include: band energies, energy ratios, log-energy, entropy, freq centroid,
+    ridge extraction + ridge sharpness, highfreq volatility, rolling stats, and optional
+    calibration helpers.
+
+Requirements:
+  pip install ssqueezepy numpy pandas scipy scikit-learn lightgbm
+
+Usage summary:
+  - call build_scales(...) to compute log-spaced scales that map to desired periods
+  - call extract_sst_features(signal, dt_minutes, scales, ...) to get per-time features
+  - features are shifted to avoid future leakage and ready to join into model X matrix
+
+Note: this pipeline focuses on numeric stability: scale-normalization, log1p-compression
+and optional per-series normalization for multi-series training.
+
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.stats import entropy as scipy_entropy
+from sklearn.decomposition import PCA
+
+# ssqueezepy imports
+try:
+    from ssqueezepy import cwt, sst, reconstruct, wavelets
+except Exception as e:
+    raise ImportError('ssqueezepy is required: pip install ssqueezepy') from e
+
+# LightGBM stub imports for example training
+try:
+    import lightgbm as lgb
+except Exception:
+    lgb = None
+
+# ----------------------------- utility functions ---------------------------------
+
+def central_frequency_morlet():
+    # ssqueezepy wavelet center frequency (approx for Morlet); rely on wavelets module
+    try:
+        # ssqueezepy provides morlet params; return approximate center freq
+        w = wavelets.Morlet()
+        return w.cf
+    except Exception:
+        # fallback hard-coded: ~0.8125 commonly used
+        return 0.8125
+
+
+def build_scales(dt_minutes: float, period_min_min: float = 60.0, period_max_min: float = 7 * 24 * 60, n_scales: int = 120):
+    """Build log-spaced scales so that scales map to periods in minutes.
+
+    scale = (T * fc) / dt  => T (minutes) -> scale
+    We return scales as float array to feed ssqueezepy.cwt
+    """
+    fc = central_frequency_morlet()
+    s_min = (period_min_min * fc) / dt_minutes
+    s_max = (period_max_min * fc) / dt_minutes
+    scales = np.geomspace(max(1.0, s_min), max(s_min + 1e-6, s_max), num=n_scales)
+    return scales
+
+
+# ----------------------------- main feature extractor ----------------------------
+
+def extract_sst_features(signal: np.ndarray,
+                         dt_minutes: float = 5.0,
+                         scales: np.ndarray = None,
+                         wavelet_name: str = 'morlet',
+                         window_roll: int = 12,
+                         low_band_frac: float = 0.33,
+                         high_band_frac: float = 0.33,
+                         pca_components: int = 5,
+                         shift: int = 1):
+    """Compute SST/CWT-based features for a 1D signal.
+
+    Params
+    ------
+    signal: 1D array
+    dt_minutes: sampling interval in minutes
+    scales: scales array (if None, builds defaults with build_scales)
+    window_roll: rolling window (in samples) to compute local averaging
+    low_band_frac/high_band_frac: fractions of scale axis to consider low/high bands
+    pca_components: number of PCA components to return from normalized |Wx| matrix
+    shift: how many time steps to shift features forward to avoid leakage (>=1)
+
+    Returns
+    -------
+    df_features: pandas.DataFrame with same length as signal (NaN for initial rows)
+    sst_dict: dictionary with raw SST outputs useful for debug/visualization
+    """
+    x = np.asarray(signal).astype(float)
+    n = x.shape[0]
+
+    if scales is None:
+        scales = build_scales(dt_minutes)
+
+    # compute cwt coefficients (complex) using ssqueezepy cwt
+    Wx, scales_out = cwt(x, scales=scales, wavelet=wavelet_name)
+    # Wx shape: (n_scales, n_times)
+
+    # Optionally compute Synchrosqueezed transform (SST) for sharper time-frequency
+    Sx, freq_bins = sst(Wx, scales_out, wavelet=wavelet_name, fs=1.0 / (dt_minutes))
+    # Sx shape: (n_freqbins, n_times) - energy concentrated
+
+    # Work with energies
+    energy_cwt = np.abs(Wx) ** 2             # (n_scales, n_times)
+    # normalize by scale to reduce scale dependence (simple approach)
+    energy_cwt_norm = energy_cwt / (scales_out[:, None] + 1e-12)
+
+    # SST energy (already concentrated); sum across freqbins
+    energy_sst = np.abs(Sx) ** 2             # (n_bins, n_times)
+
+    # aggregate band energies on CWT-normalized grid
+    n_scales = energy_cwt_norm.shape[0]
+    hi_start = 0
+    hi_end = int(max(1, np.floor(n_scales * high_band_frac)))
+    lo_start = int(np.ceil(n_scales * (1.0 - low_band_frac)))
+    lo_end = n_scales
+
+    band_high = np.sum(energy_cwt_norm[hi_start:hi_end, :], axis=0)
+    band_low = np.sum(energy_cwt_norm[lo_start:lo_end, :], axis=0)
+    band_mid = np.sum(energy_cwt_norm[hi_end:lo_start, :], axis=0)
+
+    # total energy (normed)
+    total_energy = np.sum(energy_cwt_norm, axis=0) + 1e-12
+
+    # ratios and log-compressed features
+    energy_ratio = band_high / (band_low + 1e-12)
+    log_energy_ratio = np.log1p(band_high) - np.log1p(band_low)
+
+    # entropy on scale-energy distribution (per time)
+    p = energy_cwt_norm / (total_energy[None, :] + 1e-12)
+    # compute Shannon entropy per time over scales
+    ent = scipy_entropy(p + 1e-12, base=np.e, axis=0)
+
+    # frequency centroid: need frequency axis mapping
+    # ssqueezepy provides frequencies for SST freqbins; use Sx for centroid
+    try:
+        # freq_bins from sst is in cycles per unit sample (since we passed fs=1/dt_minutes)
+        freqs = freq_bins
+        # centroid using SST energy is more robust than using raw Wx
+        sst_energy = np.sum(energy_sst, axis=0) + 1e-12
+        centroid = np.sum((freqs[:, None] * energy_sst), axis=0) / sst_energy
+    except Exception:
+        centroid = np.zeros(n)
+
+    # dominant scale (argmax on normalized cwt energy averaged over small window)
+    # compute per-time mean energy per scale using small smoothing window
+    pad = 0
+    window = max(1, int(window_roll))
+    # compute moving average along time axis using convolution for speed (same for many features)
+    kernel = np.ones(window) / window
+    def rolling_axis_mean(arr):
+        # arr shape (scales, times) -> return (scales, times) moving mean along axis=1
+        from scipy.signal import fftconvolve
+        return fftconvolve(arr, kernel[None, :], mode='same')
+
+    energy_smooth = rolling_axis_mean(energy_cwt_norm)
+    dominant_idx = np.argmax(energy_smooth, axis=0)  # index of dominant scale
+    dominant_scale = scales_out[dominant_idx]
+    dominant_conf = np.max(energy_smooth, axis=0) / (np.sum(energy_smooth, axis=0) + 1e-12)
+
+    # ridge extraction from SST (ssqueezepy has ridge extraction utilities but expose simple method)
+    try:
+        # use simple ridge: pick freq bin with max energy per time
+        ridge_idx = np.argmax(np.abs(Sx), axis=0)
+        ridge_freq = freq_bins[ridge_idx]
+        # ridge sharpness: how concentrated the ridge is vs neighbors
+        neighbor_sum = np.zeros_like(ridge_idx, dtype=float)
+        for off in (-1, 1):
+            neighbor = np.roll(np.abs(Sx), off, axis=0)
+            neighbor_sum += np.take_along_axis(neighbor, ridge_idx[None, :], axis=0)[0]
+        ridge_sharpness = (np.take_along_axis(np.abs(Sx), ridge_idx[None, :], axis=0)[0]) / (neighbor_sum + 1e-12)
+    except Exception:
+        ridge_freq = np.zeros(n)
+        ridge_sharpness = np.zeros(n)
+
+    # highfrequency volatility: rolling std of high band energy
+    high_vol_roll = pd.Series(band_high).rolling(window=window_roll, min_periods=1).std().values
+
+    # PCA on |Wx| across scales to produce compact shape features
+    pca_feat = None
+    try:
+        coeffs_abs = np.abs(Wx).T  # shape (n_times, n_scales)
+        pca = PCA(n_components=min(pca_components, coeffs_abs.shape[1]))
+        pca_trans = pca.fit_transform(coeffs_abs)
+        # transpose to time-major columns
+        pca_feat = pca_trans  # shape (n_times, k)
+    except Exception:
+        pca_feat = np.zeros((n, max(0, pca_components)))
+
+    # build DataFrame of features
+    df = pd.DataFrame(index=np.arange(n))
+    df['band_high'] = band_high
+    df['band_mid'] = band_mid
+    df['band_low'] = band_low
+    df['total_energy'] = total_energy
+    df['energy_ratio'] = energy_ratio
+    df['log_energy_ratio'] = log_energy_ratio
+    df['entropy'] = ent
+    df['freq_centroid'] = centroid
+    df['dominant_scale'] = dominant_scale
+    df['dominant_conf'] = dominant_conf
+    df['ridge_freq'] = ridge_freq
+    df['ridge_sharpness'] = ridge_sharpness
+    df['high_vol_roll'] = high_vol_roll
+
+    # attach PCA features
+    for i in range(pca_feat.shape[1]):
+        df[f'pca_wx_{i}'] = pca_feat[:, i]
+
+    # apply log1p compression to energy-like columns to stabilize
+    for col in ['band_high', 'band_mid', 'band_low', 'total_energy', 'energy_ratio', 'log_energy_ratio', 'high_vol_roll']:
+        if col in df:
+            df[col] = np.log1p(df[col])
+
+    # shift features forward by `shift` to avoid leakage: feature at t uses data up to t-shift
+    if shift > 0:
+        df = df.shift(shift)
+
+    # optional: per-series normalization (user handles multi-series outside)
+
+    sst_dict = {
+        'Wx': Wx,
+        'scales': scales_out,
+        'Sx': Sx,
+        'freq_bins': freq_bins,
+    }
+
+    return df, sst_dict
+
+
+# --------------------------- example training snippet ----------------------------
+
+def example_train(X_df: pd.DataFrame, y: np.ndarray):
+    """Simple LightGBM train example; expects X_df aligned and NaNs dropped outside.
+    Returns booster and feature importance.
+    """
+    if lgb is None:
+        raise ImportError('lightgbm required for training example')
+
+    # drop rows with NaN (prefix due to shift/rolling)
+    mask = ~X_df.isna().any(axis=1)
+    X = X_df.loc[mask]
+    y_clean = y[mask.values]
+
+    dtrain = lgb.Dataset(X, label=y_clean)
+    params = {
+        'objective': 'regression',
+        'metric': 'l2',
+        'learning_rate': 0.05,
+        'num_leaves': 64,
+        'verbosity': -1,
+    }
+    bst = lgb.train(params, dtrain, num_boost_round=500)
+    fi = bst.feature_importance(importance_type='gain')
+    feat_names = X.columns.tolist()
+    fi_df = pd.DataFrame({'feature': feat_names, 'gain': fi}).sort_values('gain', ascending=False)
+    return bst, fi_df
+
+
+# --------------------------- small demo (if run as script) -----------------------
+if __name__ == '__main__':
+    # create toy signal: weekly + daily + spikes
+    import matplotlib.pyplot as plt
+    t = np.arange(0, 7*24*12)  # 5-min samples for 7 days
+    # base weekly and daily signals
+    daily = 50 * np.sin(2*np.pi * t / (12*24))  # 1-day period in 5-min units = 288 samples
+    weekly = 200 * np.sin(2*np.pi * t / (12*24*7))
+    noise = 20 * np.random.randn(len(t))
+    spikes = np.zeros_like(t, dtype=float)
+    spikes[np.random.choice(len(t), size=20, replace=False)] = 500 * np.random.rand(20)
+    signal = weekly + daily + noise + spikes
+
+    scales = build_scales(dt_minutes=5.0, period_min_min=60.0, period_max_min=7*24*60, n_scales=120)
+    df_feats, debug = extract_sst_features(signal, dt_minutes=5.0, scales=scales, window_roll=12, shift=1)
+
+    print(df_feats.tail())
+
+    # quick plot of energy ratio and centroid
+    plt.figure(figsize=(12,6))
+    plt.plot(df_feats['energy_ratio'].fillna(method='bfill')[:1000], label='energy_ratio')
+    plt.plot(df_feats['freq_centroid'].fillna(method='bfill')[:1000], label='freq_centroid')
+    plt.legend()
+    plt.show()
+
+"""
+Pipeline notes:
+- The code uses simple heuristics: dividing scales into high/mid/low fraction. You can adjust
+  bands by mapping scales->periods and selecting custom ranges (e.g., hour/day/week bands).
+- energy normalization: dividing by scale is a pragmatic choice; you may try sqrt or no-normalize.
+- For multi-series, compute per-series features and optionally normalize per-series (median/IQR).
+- Use sst_dict outputs for visualization and diagnostics; Sx provides sharpened time-frequency view.
+"""
