@@ -1,0 +1,471 @@
+"""
+时间序列特征提取 + 降维 + 聚类 工具（可扩展、并行、工程化）
+
+说明
+- 目标：为大规模时间序列（例如 AIOps 指标）提取一套严谨且丰富的特征，用于后续的聚类/分类与建模策略划分。
+- 输出：features.parquet（或 CSV），以及可选的降维结果与聚类标签文件。
+
+依赖：
+  pip install numpy pandas scipy statsmodels scikit-learn ruptures umap-learn hdbscan joblib pywt
+（其中 hdbscan/umap 可选；若不可用可改为 KMeans/PCA）
+
+用法示例：
+  python ts_feature_extraction_clustering.py --input-csv data/all_series.csv --id-col series_id --ts-col value --time-col timestamp \
+    --output-features out/features.parquet --n-jobs 8 --cluster-method hdbscan --use-umap
+
+数据格式说明（输入CSV）：
+  每行一条观测，包含序列ID、时间戳、观测值。脚本会按序列ID分组，按时间排序后对每条序列提取特征。
+
+"""
+
+from __future__ import annotations
+import argparse
+import os
+import math
+import json
+from typing import List, Dict, Any, Tuple
+import numpy as np
+import pandas as pd
+from scipy.stats import skew, kurtosis
+from scipy.signal import periodogram
+from scipy import fftpack
+from statsmodels.tsa.stattools import adfuller, acf
+from statsmodels.tsa.seasonal import STL
+from sklearn.preprocessing import RobustScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+import ruptures as rpt
+import logging
+from joblib import Parallel, delayed
+
+# optional imports
+try:
+    import umap
+except Exception:
+    umap = None
+try:
+    import hdbscan
+except Exception:
+    hdbscan = None
+try:
+    import pywt
+except Exception:
+    pywt = None
+
+# ----------------------------- 基础工具函数 -----------------------------
+
+logger = logging.getLogger("ts_feature_extractor")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+EPS = 1e-9
+
+def safe_mean(x: np.ndarray) -> float:
+    x = x[~np.isnan(x)]
+    return float(np.mean(x)) if x.size > 0 else 0.0
+
+def safe_std(x: np.ndarray) -> float:
+    x = x[~np.isnan(x)]
+    return float(np.std(x, ddof=0)) if x.size > 0 else 0.0
+
+# --------------------------- 特征计算函数 -------------------------------
+
+def basic_stats(x: np.ndarray) -> Dict[str, float]:
+    x = np.asarray(x)
+    x = x[~np.isnan(x)]
+    if x.size == 0:
+        return {k: 0.0 for k in [
+            "mean","median","std","min","max","range","skew","kurtosis",
+            "q10","q25","q50","q75","q90","cv"
+        ]}
+    q = np.quantile(x, [0.1,0.25,0.5,0.75,0.9])
+    mean = float(np.mean(x))
+    std = float(np.std(x, ddof=0))
+    cv = std/mean if abs(mean) > EPS else 0.0
+    return {
+        "mean": mean,
+        "median": float(q[2]),
+        "std": std,
+        "min": float(x.min()),
+        "max": float(x.max()),
+        "range": float(x.max()-x.min()),
+        "skew": float(skew(x)) if x.size>2 else 0.0,
+        "kurtosis": float(kurtosis(x)) if x.size>3 else 0.0,
+        "q10": float(q[0]),
+        "q25": float(q[1]),
+        "q50": float(q[2]),
+        "q75": float(q[3]),
+        "q90": float(q[4]),
+        "cv": float(cv)
+    }
+
+# trend slope via linear regression
+def trend_slope(x: np.ndarray) -> float:
+    x = np.asarray(x)
+    n = x.size
+    if n < 2:
+        return 0.0
+    t = np.arange(n)
+    t_mean = t.mean()
+    x_mean = x.mean()
+    denom = np.sum((t - t_mean)**2)
+    if abs(denom) < EPS:
+        return 0.0
+    slope = np.sum((t - t_mean)*(x - x_mean)) / denom
+    return float(slope)
+
+# ADF test p-value
+def adf_pvalue(x: np.ndarray) -> float:
+    try:
+        res = adfuller(x, maxlag=10, autolag='AIC')
+        return float(res[1])
+    except Exception:
+        return 1.0
+
+# Ljung-Box p-value (portmanteau test) - use acf and simple chi-square approx
+def ljung_box_pvalue(x: np.ndarray, lags: int = 10) -> float:
+    try:
+        from statsmodels.stats.diagnostic import acorr_ljungbox
+        res = acorr_ljungbox(x, lags=[lags], return_df=True)
+        return float(res['lb_pvalue'].iloc[0])
+    except Exception:
+        return 1.0
+
+# ACF values (first k lags)
+def acf_features(x: np.ndarray, nlags: int = 12) -> Dict[str, float]:
+    try:
+        vals = acf(x, nlags=nlags, fft=True, missing='conservative')
+        out = {}
+        for i, v in enumerate(vals[1:], start=1):
+            out[f"acf_lag_{i}"] = float(v)
+        return out
+    except Exception:
+        return {f"acf_lag_{i}": 0.0 for i in range(1, nlags+1)}
+
+# spectral features: dominant frequency, dominant power, spectral entropy
+def spectral_features(x: np.ndarray, fs: float = 1.0, top_k: int = 3) -> Dict[str, float]:
+    x = np.asarray(x)
+    if x.size < 2:
+        return {"spec_dom_freq":0.0, "spec_dom_power":0.0, "spec_entropy":1.0}
+    f, Pxx = periodogram(x, fs=fs)
+    if Pxx.sum() <= 0:
+        return {"spec_dom_freq":0.0, "spec_dom_power":0.0, "spec_entropy":1.0}
+    # ignore DC
+    idx = np.argmax(Pxx[1:]) + 1 if Pxx.size>1 else 0
+    total = Pxx.sum() + EPS
+    p = Pxx/total
+    spec_entropy = -np.sum(p * np.log(p + 1e-12))
+    top_idx = np.argsort(Pxx)[-top_k:][::-1]
+    top_freqs = f[top_idx]
+    top_powers = Pxx[top_idx]
+    return {
+        "spec_dom_freq": float(f[idx]),
+        "spec_dom_power": float(Pxx[idx]),
+        "spec_entropy": float(spec_entropy),
+        "spec_top1_freq": float(top_freqs[0]) if top_freqs.size>0 else 0.0,
+        "spec_top1_power": float(top_powers[0]) if top_powers.size>0 else 0.0,
+    }
+
+# seasonal strength via STL decomposition
+def seasonal_strength(x: np.ndarray, period: int) -> float:
+    try:
+        if period <= 1 or x.size < period*2:
+            return 0.0
+        stl = STL(x, period=period, robust=True)
+        res = stl.fit()
+        s_var = np.nanvar(res.seasonal)
+        r_var = np.nanvar(res.resid)
+        strength = s_var / (s_var + r_var + EPS)
+        return float(strength)
+    except Exception:
+        return 0.0
+
+# spike / pulse metrics
+def spike_metrics(x: np.ndarray, window: int = 12, alpha: float = 3.0) -> Dict[str, float]:
+    x = np.asarray(x)
+    if x.size < 2:
+        return {"spike_rate":0.0, "max_diff":0.0, "mean_abs_diff":0.0}
+    diff = np.abs(np.diff(x, prepend=x[0]))
+    mad = np.median(np.abs(x - np.median(x))) + EPS
+    spikes = diff > (alpha * mad)
+    spike_rate = float(np.mean(spikes))
+    return {"spike_rate": spike_rate, "max_diff": float(diff.max()), "mean_abs_diff": float(diff.mean())}
+
+# rolling volatility features (mean of rolling std over multiple windows)
+def rolling_volatility_features(x: np.ndarray, windows: List[int] = [3,6,12,24]) -> Dict[str, float]:
+    out = {}
+    x = np.asarray(x)
+    for w in windows:
+        if x.size < w:
+            out[f"rollstd_{w}"] = 0.0
+        else:
+            roll = pd.Series(x).rolling(window=w, min_periods=1).std().mean()
+            out[f"rollstd_{w}"] = float(roll)
+    return out
+
+# change point count via ruptures (rbf) with penalty
+def changepoint_count(x: np.ndarray, pen: float = 10.0) -> Dict[str, float]:
+    try:
+        algo = rpt.Pelt(model="rbf").fit(x)
+        bkps = algo.predict(pen=pen)
+        n = max(0, len(bkps)-1)
+        return {"n_changepoints": float(n)}
+    except Exception:
+        return {"n_changepoints": 0.0}
+
+# Hurst exponent (rescaled range)
+def hurst_exponent(ts: np.ndarray) -> float:
+    ts = np.asarray(ts)
+    N = ts.size
+    if N < 20:
+        return 0.5
+    T = np.arange(1, N+1)
+    Y = np.cumsum(ts - np.mean(ts))
+    R = np.zeros(N)
+    S = np.zeros(N)
+    for n in range(1, N+1):
+        R[n-1] = np.max(Y[:n]) - np.min(Y[:n])
+        S[n-1] = np.std(ts[:n], ddof=1)
+    RdivS = R[1:]/(S[1:]+EPS)
+    RdivS = RdivS[RdivS>0]
+    if RdivS.size < 2:
+        return 0.5
+    lnR = np.log(RdivS)
+    lnn = np.log(np.arange(2, 2+lnR.size))
+    m = np.polyfit(lnn, lnR, 1)
+    return float(m[0])
+
+# sample entropy implementation (approximate, suitable for moderate lengths)
+def sample_entropy(x: np.ndarray, m: int = 2, r_scale: float = 0.2) -> float:
+    x = np.asarray(x)
+    n = x.size
+    if n <= m+1:
+        return 0.0
+    r = r_scale * np.std(x)
+    def _phi(m):
+        count = 0
+        total = 0
+        for i in range(n - m + 1):
+            xi = x[i:i+m]
+            for j in range(i+1, n - m + 1):
+                xj = x[j:j+m]
+                if np.max(np.abs(xi-xj)) <= r:
+                    count += 1
+                total += 1
+        return count / (total + EPS)
+    try:
+        return float(-np.log((_phi(m+1) + EPS) / (_phi(m) + EPS)))
+    except Exception:
+        return 0.0
+
+# wavelet energy bands (requires pywt)
+def wavelet_energy_features(x: np.ndarray, wavelet: str = 'db4', level: int = 3) -> Dict[str, float]:
+    if pywt is None:
+        return {f"wave_energy_{i}":0.0 for i in range(level+1)}
+    coeffs = pywt.wavedec(x, wavelet, level=level)
+    energies = [np.sum(c**2) for c in coeffs]
+    total = sum(energies) + EPS
+    return {f"wave_energy_{i}": float(e/total) for i,e in enumerate(energies)}
+
+# AR model parameters (fit small AR via numpy.linalg)
+def ar_coeffs(x: np.ndarray, p: int = 3) -> Dict[str, float]:
+    x = np.asarray(x)
+    n = x.size
+    if n <= p:
+        return {f"ar_coef_{i}":0.0 for i in range(1,p+1)}
+    # build Toeplitz matrix
+    X = np.column_stack([x[i:n-p+i] for i in range(p)])
+    y = x[p:]
+    try:
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        out = {f"ar_coef_{i+1}": float(coef[i]) for i in range(p)}
+        return out
+    except Exception:
+        return {f"ar_coef_{i}":0.0 for i in range(1,p+1)}
+
+# zero crossing rate
+def zero_crossing_rate(x: np.ndarray) -> float:
+    x = np.asarray(x)
+    if x.size < 2:
+        return 0.0
+    s = np.sign(x - np.mean(x))
+    return float(((s[:-1] * s[1:]) < 0).mean())
+
+# ---------------------- 单序列特征抽取主函数 ---------------------------
+
+def extract_features(series: np.ndarray, fs: float = 1.0, period: int = None) -> Dict[str, Any]:
+    """
+    从一个一维 numpy 序列提取特征。返回字典。
+    fs: 采样频率（每 unit 时间点数），用于频谱分析；例如：若每 5 分钟采样，假设 time unit 1=min，则 fs=1/(5)
+    period: 如已知的季节性周期（例如 288 for daily if 5-minute data），若为 None 将尝试估算。
+    """
+    x = np.asarray(series).astype(float)
+    feats: Dict[str, Any] = {}
+    # 基础统计
+    feats.update(basic_stats(x))
+    feats['length'] = float(x.size)
+    # 趋势和平稳性
+    feats['trend_slope'] = float(trend_slope(x))
+    feats['adf_p'] = float(adf_pvalue(x))
+    feats['ljungbox_p'] = float(ljung_box_pvalue(x))
+    # ACF
+    feats.update(acf_features(x, nlags=12))
+    # spectral
+    feats.update(spectral_features(x, fs=fs, top_k=3))
+    # seasonal_strength - if period not provided, try to infer from dominant frequency
+    inferred_period = None
+    if 'spec_dom_freq' in feats and feats['spec_dom_freq'] > 0:
+        inferred_period = max(1, int(round(1.0 / (feats['spec_dom_freq'] + EPS))))
+    if period is None:
+        period_try = inferred_period if inferred_period is not None else 0
+    else:
+        period_try = period
+    feats['seasonal_strength'] = float(seasonal_strength(x, period=period_try if period_try>0 else 1))
+    # spike / pulse
+    feats.update(spike_metrics(x))
+    # rolling volatility
+    feats.update(rolling_volatility_features(x, windows=[3,6,12,24]))
+    # changepoints
+    feats.update(changepoint_count(x, pen=10))
+    # hurst
+    feats['hurst'] = float(hurst_exponent(x))
+    # sample entropy
+    feats['sample_entropy'] = float(sample_entropy(x))
+    # wavelet
+    feats.update(wavelet_energy_features(x, level=3))
+    # AR coeffs
+    feats.update(ar_coeffs(x, p=3))
+    # zero crossing
+    feats['zero_crossing_rate'] = float(zero_crossing_rate(x))
+
+    return feats
+
+# ------------------- 批量并行抽特征与保存 -------------------------------
+
+def process_group(df_group: pd.DataFrame, value_col: str = 'value') -> Dict[str, Any]:
+    """接收单个序列的 DataFrame（已按时间排序）并返回 (series_id, features)"""
+    series_id = df_group.name
+    arr = df_group[value_col].values.astype(float)
+    feats = extract_features(arr)
+    feats['series_id'] = series_id
+    return feats
+
+
+def build_feature_matrix_from_dataframe(df: pd.DataFrame, id_col: str, time_col: str, value_col: str, n_jobs: int = 4) -> pd.DataFrame:
+    groups = [g for _, g in df.groupby(id_col)]
+    logger.info(f"Processing {len(groups)} series with n_jobs={n_jobs}")
+    results = Parallel(n_jobs=n_jobs, backend='loky')(
+        delayed(process_group)(g.sort_values(time_col), value_col=value_col) for g in groups
+    )
+    feats_df = pd.DataFrame(results)
+    feats_df = feats_df.set_index('series_id')
+    # fill NaN
+    feats_df = feats_df.fillna(0.0)
+    return feats_df
+
+# ------------------ 降维与聚类流水线 -----------------------------
+
+def cluster_pipeline(features: pd.DataFrame,
+                     method: str = 'hdbscan',
+                     use_umap: bool = True,
+                     n_components_pca: int = 10,
+                     umap_n_neighbors: int = 15,
+                     min_cluster_size: int = 10,
+                     n_clusters_kmeans: int = 8) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    features: indexed by series_id
+    返回：features_with_labels (包含 cluster 列) 以及 metadata
+    """
+    meta = {}
+    X = features.values
+    scaler = RobustScaler()
+    Xs = scaler.fit_transform(X)
+    meta['scaler'] = scaler
+
+    # optional PCA for noise reduction
+    if Xs.shape[1] > n_components_pca:
+        pca = PCA(n_components=n_components_pca, random_state=42)
+        Xp = pca.fit_transform(Xs)
+        meta['pca_explained_ratio'] = float(pca.explained_variance_ratio_.sum())
+    else:
+        Xp = Xs
+        pca = None
+    meta['pca'] = pca
+
+    # UMAP for visualization / optional embedding for clustering
+    embedding = None
+    if use_umap and umap is not None:
+        reducer = umap.UMAP(n_components=2, random_state=42)
+        embedding = reducer.fit_transform(Xp)
+        meta['umap'] = reducer
+    
+    labels = None
+    if method == 'hdbscan' and hdbscan is not None:
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size)
+        labels = clusterer.fit_predict(Xp)
+        meta['clusterer'] = clusterer
+    elif method == 'kmeans':
+        kmeans = KMeans(n_clusters=n_clusters_kmeans, random_state=42)
+        labels = kmeans.fit_predict(Xp)
+        meta['clusterer'] = kmeans
+    else:
+        raise ValueError(f"Unknown clustering method {method} or required package not installed")
+
+    features_out = features.copy()
+    features_out['cluster'] = labels
+    if embedding is not None:
+        features_out['umap_x'] = embedding[:,0]
+        features_out['umap_y'] = embedding[:,1]
+    meta['labels'] = labels
+    return features_out, meta
+
+# --------------------------- CLI / 主流程 -------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--input-csv', required=True, help='输入 CSV（每行：series_id, timestamp, value）')
+    p.add_argument('--id-col', default='series_id')
+    p.add_argument('--time-col', default='timestamp')
+    p.add_argument('--ts-format', default=None, help='pandas to_datetime 格式（可选）')
+    p.add_argument('--value-col', default='value')
+    p.add_argument('--output-features', default='features.parquet')
+    p.add_argument('--output-clusters', default='clusters.parquet')
+    p.add_argument('--n-jobs', type=int, default=4)
+    p.add_argument('--cluster-method', choices=['hdbscan','kmeans'], default='hdbscan')
+    p.add_argument('--use-umap', action='store_true')
+    p.add_argument('--min-cluster-size', type=int, default=10)
+    p.add_argument('--n-clusters-kmeans', type=int, default=8)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    logger.info(f"Reading input {args.input_csv}")
+    df = pd.read_csv(args.input_csv)
+    if args.ts_format:
+        df[args.time_col] = pd.to_datetime(df[args.time_col], format=args.ts_format)
+    else:
+        df[args.time_col] = pd.to_datetime(df[args.time_col], errors='coerce')
+    # drop rows with NA in time or value
+    df = df.dropna(subset=[args.time_col, args.value_col])
+    # ensure sorting per group
+    df = df.sort_values([args.id_col, args.time_col])
+
+    feats_df = build_feature_matrix_from_dataframe(df, id_col=args.id_col, time_col=args.time_col, value_col=args.value_col, n_jobs=args.n_jobs)
+    logger.info(f"Extracted features shape: {feats_df.shape}")
+    feats_df.to_parquet(args.output_features)
+    logger.info(f"Saved features to {args.output_features}")
+
+    # clustering
+    try:
+        clustered, meta = cluster_pipeline(feats_df, method=args.cluster_method, use_umap=args.use_umap, min_cluster_size=args.min_cluster_size, n_clusters_kmeans=args.n_clusters_kmeans)
+        clustered.to_parquet(args.output_clusters)
+        logger.info(f"Saved clustered features to {args.output_clusters}")
+        # save metadata (small) for reproducibility
+        meta_small = {k: str(type(v)) for k,v in meta.items() if k!='umap' and k!='clusterer' and k!='pca'}
+        with open('cluster_meta.json', 'w') as f:
+            json.dump(meta_small, f)
+    except Exception as e:
+        logger.exception("Clustering failed")
+
+if __name__ == '__main__':
+    main()
