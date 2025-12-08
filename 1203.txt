@@ -1,209 +1,59 @@
+from hdbscan import HDBSCAN
+from hdbscan.validity import validity_index
+from sklearn.metrics import silhouette_score
 import numpy as np
-import scipy.signal as signal
-from scipy.fft import rfft, rfftfreq
-from scipy.stats import skew, kurtosis
-import pywt
+import pandas as pd
 
-EPS = 1e-12
-
-# ---------------------------
-# 0. Utility: Robust Normalization
-# ---------------------------
-def robust_norm(x):
-    """Robust normalization: (x - median) / MAD"""
-    x = np.asarray(x, float)
-    med = np.median(x)
-    mad = np.median(np.abs(x - med)) + EPS
-    return (x - med) / mad
-
-
-# ---------------------------
-# 1. Basic Statistics (10+)
-# ---------------------------
-def basic_stats(x):
-    return {
-        "mean": float(np.mean(x)),
-        "std": float(np.std(x)),
-        "min": float(np.min(x)),
-        "max": float(np.max(x)),
-        "q25": float(np.percentile(x, 25)),
-        "median": float(np.median(x)),
-        "q75": float(np.percentile(x, 75)),
-        "iqr": float(np.percentile(x, 75) - np.percentile(x, 25)),
-        "skew": float(skew(x)),
-        "kurtosis": float(kurtosis(x)),
-    }
-
-
-# ---------------------------
-# 2. Autocorrelation & Lag features (12+)
-# ---------------------------
-def acf_features(x, nlags=20):
-    acfs = []
-    x = x - np.mean(x)
-    denom = np.dot(x, x) + EPS
-    for lag in range(1, nlags + 1):
-        num = np.dot(x[:-lag], x[lag:])
-        acfs.append(num / denom)
-    return {f"acf_lag_{i}": float(acfs[i - 1]) for i in range(1, nlags + 1)}
-
-
-# ---------------------------
-# 3. Differences & Diff-Stats (10+)
-# ---------------------------
-def diff_stats(x):
-    d1 = np.diff(x)
-    d2 = np.diff(d1)
-
-    def _s(v):
-        return {
-            "mean": float(np.mean(v)),
-            "std": float(np.std(v)),
-            "min": float(np.min(v)),
-            "max": float(np.max(v)),
-            "q95": float(np.percentile(v, 95)),
-            "abs_mean": float(np.mean(np.abs(v))),
-        }
-
-    feats = {}
-    feats.update({f"d1_{k}": v for k, v in _s(d1).items()})
-    feats.update({f"d2_{k}": v for k, v in _s(d2).items()})
-
-    return feats
-
-
-# ---------------------------
-# 4. Frequency Domain (10+)
-# ---------------------------
-def spectral_features(x, fs=1.0, top_k=3):
-    N = len(x)
-    freqs = rfftfreq(N, d=1.0/fs)
-    spectrum = np.abs(rfft(x))
-
-    total_energy = np.sum(spectrum**2) + EPS
-    dom_idx = np.argsort(spectrum)[-top_k:][::-1]
-
-    feats = {
-        "spec_total_energy": float(total_energy),
-        "spec_centroid": float(np.sum(freqs * spectrum) / (np.sum(spectrum) + EPS)),
-        "spec_bandwidth": float(np.sqrt(np.sum(((freqs - freqs.mean())**2) * spectrum) / (np.sum(spectrum) + EPS))),
-        "spec_flatness": float(np.exp(np.mean(np.log(spectrum + EPS))) / (np.mean(spectrum) + EPS)),
-    }
-
-    for i, idx in enumerate(dom_idx):
-        feats[f"spec_top_freq_{i}"] = float(freqs[idx])
-        feats[f"spec_top_power_{i}"] = float(spectrum[idx])
-
-    return feats
-
-
-# ---------------------------
-# 5. Seasonal Strength (no trend needed) (3)
-# ---------------------------
-def seasonal_strength(x, period):
-    if period < 2 or period >= len(x):
-        return 0.0
-    xs = x[: (len(x) // period) * period]
-    xs = xs.reshape(-1, period)
-    s_var = np.var(np.mean(xs, axis=0))
-    t_var = np.var(xs)
-    return float(s_var / (t_var + EPS))
-
-
-# ---------------------------
-# 6. Spike / Pulse Metrics (8+)
-# ---------------------------
-def spike_features(x, threshold=3.0):
-    z = (x - np.mean(x)) / (np.std(x) + EPS)
-    spike_idx = np.where(np.abs(z) > threshold)[0]
-    count = len(spike_idx)
-
-    return {
-        "spike_count": float(count),
-        "spike_rate": float(count / len(x)),
-        "spike_max_z": float(np.max(np.abs(z))),
-        "spike_mean_z": float(np.mean(np.abs(z[spike_idx])) if count > 0 else 0.0),
-    }
-
-
-# ---------------------------
-# 7. Volatility & Rolling Metrics (15+)
-# ---------------------------
-def rolling_metrics(x, windows=[3, 6, 12, 24]):
-    feats = {}
-    for w in windows:
-        if len(x) < w:
-            feats[f"roll_std_w{w}"] = 0
-            feats[f"roll_mad_w{w}"] = 0
-            continue
-        roll = np.lib.stride_tricks.sliding_window_view(x, w)
-        feats[f"roll_std_w{w}"] = float(np.mean(np.std(roll, axis=1)))
-        feats[f"roll_mad_w{w}"] = float(np.mean(np.median(np.abs(roll - np.median(roll, axis=1, keepdims=True)), axis=1)))
-    return feats
-
-
-# ---------------------------
-# 8. Wavelet Energy (10+)
-# ---------------------------
-def wavelet_energy(x, wavelet="db4", level=4):
-    coeffs = pywt.wavedec(x, wavelet, level=level)
-    feats = {}
-    for i, c in enumerate(coeffs):
-        feats[f"wavelet_energy_L{i}"] = float(np.sum(c**2))
-    return feats
-
-
-# ---------------------------
-# 9. Zero-crossing + Hurst (2)
-# ---------------------------
-def zero_cross_rate(x):
-    return float(np.mean(np.diff(np.sign(x)) != 0))
-
-def hurst_exponent(x):
-    N = len(x)
-    if N < 50:
-        return 0.5
-    taus = [2,4,8,16,32]
-    RS = []
-    for tau in taus:
-        if tau >= N:
-            break
-        zx = np.add.reduceat(x, np.arange(0, N, tau))
-        RS.append(np.std(zx) / (np.mean(np.abs(zx)) + EPS))
-    if len(RS) < 2:
-        return 0.5
-    return float(np.polyfit(np.log(taus[:len(RS)]), np.log(RS), 1)[0])
-
-
-# ===================================================================
-# ===============  MAIN FEATURE EXTRACTION (80+ features) ============
-# ===================================================================
-def extract_ts_features(x, fs=1.0, known_period=None):
-    x = np.asarray(x, float)
-    if len(x) < 10:
-        return {}
-
-    # Robust normalization
-    x = robust_norm(x)
-
-    feats = {}
-    feats.update(basic_stats(x))
-    feats.update(acf_features(x, nlags=20))
-    feats.update(diff_stats(x))
-    feats.update(spectral_features(x, fs=fs, top_k=3))
-
-    # Period detection from FFT
-    dom_f = feats["spec_top_freq_0"]
-    inferred_p = int(round(1 / (dom_f + EPS))) if dom_f > 0 else None
-
-    p = known_period if known_period else (inferred_p if inferred_p else 0)
-    feats["seasonal_strength"] = seasonal_strength(x, p) if p > 1 else 0.0
-
-    feats.update(spike_features(x))
-    feats.update(rolling_metrics(x))
-    feats.update(wavelet_energy(x))
-    feats["zero_cross_rate"] = zero_cross_rate(x)
-    feats["hurst"] = hurst_exponent(x)
-
-    feats["length"] = len(x)
-    return feats
+def evaluate_hdbscan_params(X, 
+                            min_cluster_sizes=[30,50,80,100,150,200],
+                            min_samples=[5,10,15,20,None]):
+    results = []
+    
+    for mcs M in min_cluster_sizes:
+        for ms in min_samples:
+            clusterer = HDBSCAN(min_cluster_size=mcs,
+                                min_samples=ms if ms else None,  # None=自动等于mcs
+                                cluster_selection_epsilon=0.0,
+                                metric='euclidean')
+            labels = clusterer.fit_predict(X)
+            
+            n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+            noise_ratio = (labels == -1).mean()
+            dbcv = validity_index(X.astype(np.float64), labels)  # 必须 float64
+            
+            # 1. 核心：DBCV（权重最高）
+            score1 = dbcv                                        # 0~1
+            
+            # 2. 簇数量 + 噪声惩罚
+            if 12 <= n_clusters <= 70 and noise_ratio < 0.35:
+                score2 = 1.0
+            elif n_clusters < 12:
+                score2 = n_clusters / 12
+            elif n_clusters > 70:
+                score2 = 70 / n_clusters
+            else:
+                score2 = 1 - (noise_ratio - 0.3)/0.7
+            
+            # 3. 稳定性预估（简化版：用概率噪声点比例反向估计）
+            stability_proxy = 1 - clusterer.probabilities_.mean() * 0.5
+            
+            # 综合分数（工业界真实权重）
+            final_score = 0.55 * score1 + 0.30 * score2 + 0.15 * stability_proxy
+            
+            results.append({
+                'min_cluster_size': mcs,
+                'min_samples': ms,
+                'n_clusters': n_clusters,
+                'noise_ratio': noise_ratio,
+                'dbcv': dbcv,
+                'final_score': final_score,
+                'labels': labels
+            })
+    
+    df = pd.DataFrame(results).sort_values('final_score', ascending=False)
+    best = df.iloc[0]
+    print(f"最佳参数: min_cluster_size={best.min_cluster_size}, "
+          f"min_samples={best.min_samples or best.min_cluster_size}")
+    print(f"簇数: {best.n_clusters}, 噪声率: {best.noise_ratio:.1%}, DBCV: {best.dbcv:.3f}")
+    
+    return df, best.labels
