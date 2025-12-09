@@ -1,59 +1,96 @@
-from hdbscan import HDBSCAN
-from hdbscan.validity import validity_index
-from sklearn.metrics import silhouette_score
+import torch
 import numpy as np
-import pandas as pd
+import timesfm  # 官方库
+from sklearn.cluster import KMeans  # 或用 HDBSCAN
+from sklearn.decomposition import PCA
+import umap  # 可视化
+import matplotlib.pyplot as plt
+from typing import List
 
-def evaluate_hdbscan_params(X, 
-                            min_cluster_sizes=[30,50,80,100,150,200],
-                            min_samples=[5,10,15,20,None]):
-    results = []
-    
-    for mcs M in min_cluster_sizes:
-        for ms in min_samples:
-            clusterer = HDBSCAN(min_cluster_size=mcs,
-                                min_samples=ms if ms else None,  # None=自动等于mcs
-                                cluster_selection_epsilon=0.0,
-                                metric='euclidean')
-            labels = clusterer.fit_predict(X)
+# 步骤1: 加载模型（CPU 模式）
+torch.set_float32_matmul_precision("high")  # 加速
+model = timesfm.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
+model.compile(
+    timesfm.ForecastConfig(
+        max_context=1024,  # 你的序列长度上限
+        max_horizon=256,   # 不用于 embedding
+        normalize_inputs=True,  # 自动归一化输入
+        use_continuous_quantile_head=False,  # 关闭预测头，只用 encoder
+        force_flip_invariance=True,
+        infer_is_positive=True,
+        fix_quantile_crossing=False,
+    )
+)
+model.eval()  # 推理模式
+
+# 步骤2: 提取 embedding 函数
+def extract_embeddings(model: timesfm.TimesFM_2p5_200M_torch, 
+                       inputs: List[np.ndarray], 
+                       layer_idx: int = -1,  # 默认最后一层
+                       pooling: str = 'mean') -> np.ndarray:
+    """
+    输入: list of 1D arrays (每个序列)
+    输出: [n_series, embed_dim] 的 embedding 矩阵 (embed_dim=512 for 200M model)
+    """
+    embeddings = []
+    with torch.no_grad():  # 无梯度，节省内存
+        for inp in inputs:
+            # 转 tensor，添加 batch/channel 维: [1, 1, seq_len]
+            x = torch.tensor(inp, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
             
-            n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-            noise_ratio = (labels == -1).mean()
-            dbcv = validity_index(X.astype(np.float64), labels)  # 必须 float64
+            # 前向传播，获取隐藏状态
+            outputs = model.transformer(x, output_hidden_states=True)  # 关键：output_hidden_states=True
+            hidden_states = outputs.hidden_states  # tuple of [layer, batch, seq, dim]
             
-            # 1. 核心：DBCV（权重最高）
-            score1 = dbcv                                        # 0~1
+            # 选指定层
+            layer_hidden = hidden_states[layer_idx]  # [1, seq_len, 512]
+            layer_hidden = layer_hidden.squeeze(0)  # [seq_len, 512]
             
-            # 2. 簇数量 + 噪声惩罚
-            if 12 <= n_clusters <= 70 and noise_ratio < 0.35:
-                score2 = 1.0
-            elif n_clusters < 12:
-                score2 = n_clusters / 12
-            elif n_clusters > 70:
-                score2 = 70 / n_clusters
+            # Pooling: mean 或 last token
+            if pooling == 'mean':
+                emb = layer_hidden.mean(dim=0)  # 序列级 mean pooling
+            elif pooling == 'last':
+                emb = layer_hidden[-1]  # 最后一个 token 作为 CLS-like
             else:
-                score2 = 1 - (noise_ratio - 0.3)/0.7
+                raise ValueError("pooling must be 'mean' or 'last'")
             
-            # 3. 稳定性预估（简化版：用概率噪声点比例反向估计）
-            stability_proxy = 1 - clusterer.probabilities_.mean() * 0.5
-            
-            # 综合分数（工业界真实权重）
-            final_score = 0.55 * score1 + 0.30 * score2 + 0.15 * stability_proxy
-            
-            results.append({
-                'min_cluster_size': mcs,
-                'min_samples': ms,
-                'n_clusters': n_clusters,
-                'noise_ratio': noise_ratio,
-                'dbcv': dbcv,
-                'final_score': final_score,
-                'labels': labels
-            })
+            embeddings.append(emb.numpy())
     
-    df = pd.DataFrame(results).sort_values('final_score', ascending=False)
-    best = df.iloc[0]
-    print(f"最佳参数: min_cluster_size={best.min_cluster_size}, "
-          f"min_samples={best.min_samples or best.min_cluster_size}")
-    print(f"簇数: {best.n_clusters}, 噪声率: {best.noise_ratio:.1%}, DBCV: {best.dbcv:.3f}")
-    
-    return df, best.labels
+    return np.array(embeddings)
+
+# 示例数据（替换成你的近万条序列）
+n_series = 1000  # 测试用，实际用 10000+
+seq_len = 512
+X = [np.random.randn(seq_len) for _ in range(n_series)]  # 你的数据：list of arrays
+
+# 步骤3: 获取 embedding
+embeddings = extract_embeddings(model, X, layer_idx=-1, pooling='mean')  # [1000, 512]
+print(f"Embedding shape: {embeddings.shape}")  # 输出: (1000, 512)
+
+# 步骤4: 聚类（HDBSCAN 自动簇数，适合 AIOps）
+from hdbscan import HDBSCAN
+
+# 可选: PCA 降维（高维 embedding 先降到 50 维）
+pca = PCA(n_components=50)
+embed_pca = pca.fit_transform(embeddings)
+
+# 聚类
+clusterer = HDBSCAN(min_cluster_size=50, min_samples=10)  # 参数调优
+labels = clusterer.fit_predict(embed_pca)
+print(f"Found {len(set(labels)) - (1 if -1 in labels else 0)} clusters")
+
+# 步骤5: 可视化（UMAP 2D）
+reducer = umap.UMAP(n_components=2, random_state=42)
+embed_2d = reducer.fit_transform(embed_pca)
+
+plt.figure(figsize=(10, 8))
+scatter = plt.scatter(embed_2d[:, 0], embed_2d[:, 1], c=labels, cmap='Spectral', s=10)
+plt.colorbar(scatter)
+plt.title("TimesFM Embeddings Clustering (UMAP)")
+plt.show()
+
+# 输出每类画像（e.g., 周期强度，可结合 tsfresh）
+unique_labels = np.unique(labels[labels >= 0])
+for lbl in unique_labels:
+    mask = labels == lbl
+    print(f"Cluster {lbl}: {np.sum(mask)} series, avg embedding norm: {np.linalg.norm(embeddings[mask]).mean():.2f}")
